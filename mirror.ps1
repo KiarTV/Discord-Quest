@@ -1,5 +1,5 @@
 # Discord Quest Game Mirror
-# Run with: irm https://raw.githubusercontent.com/<you>/<repo>/main/mirror.ps1 | iex
+# Run with: irm https://raw.githubusercontent.com/KiarTV/Discord-Quest/master/mirror.ps1 | iex
 #
 # Resolves a raw game name to the exact .exe filename Discord's Quest detection
 # looks for, then launches a renamed copy of a harmless stub executable so a

@@ -26,7 +26,7 @@ touch your account, other users, or any network service.
 No download needed - run directly from GitHub:
 
 ```powershell
-irm https://raw.githubusercontent.com/<you>/<repo>/main/mirror.ps1 | iex
+irm https://raw.githubusercontent.com/KiarTV/Discord-Quest/master/mirror.ps1 | iex
 ```
 
 You'll be prompted for a game name, and can keep entering more - each one
