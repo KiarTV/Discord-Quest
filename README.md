@@ -15,8 +15,10 @@ running - nothing more. This tool:
    store search to canonicalize the name (e.g. "gta 5" -> "Grand Theft Auto V")
    and retries.
 3. Copies `timeout.exe` (a built-in console app, no desktop session needed)
-   to a working folder, renamed to match, and runs it hidden for ~17.5
+   to a working folder, renamed to match, and runs it minimized for ~17.5
    minutes - a few minutes longer than the 15 minutes most Quests require.
+   It has to keep a real (if minimized) window, since Discord's game scanner
+   only picks up processes that own a window.
 
 This only affects what your own local Discord client detects. It doesn't
 touch your account, other users, or any network service.
@@ -29,10 +31,31 @@ No download needed - run directly from GitHub:
 irm https://raw.githubusercontent.com/KiarTV/Discord-Quest/master/mirror.ps1 | iex
 ```
 
-You'll be prompted for a game name, and can keep entering more - each one
-launches as its own process, so you can queue several games in parallel.
-Press Enter on a blank line to finish. To stop a mirror early, enter
-`stop <exe.exe>` (the exe name it printed when it started).
+You'll land in a small prompt (`quest-mirror >`). Type a game name to queue a
+mirror for it - each one launches as its own process, so you can queue
+several games in parallel. Slash commands handle everything else:
+
+| Command             | What it does                        |
+| -------------------- | ------------------------------------ |
+| `<game name>`         | queue a mirror for that game         |
+| `/status`             | list active mirrors and expiry times |
+| `/stop <exe.exe>`     | stop one mirror                      |
+| `/stop all`           | stop every active mirror             |
+| `/help`               | show the command list                |
+| `/exit` (or blank)    | quit - active mirrors keep running   |
+
+## Local dev / non-interactive mode
+
+For faster iteration than the interactive prompt, run the file directly with
+parameters:
+
+```powershell
+.\mirror.ps1 -GameName "Roblox"              # auto-picks the default exe
+.\mirror.ps1 -GameName "Roblox" -ExeChoice 2 # force a specific exe from the list
+```
+
+This skips all prompts and is useful for testing changes to the matching or
+executable-selection logic without typing input by hand each run.
 
 ## Notes
 
