@@ -1,13 +1,20 @@
 #!/usr/bin/env bash
 # Discord Quest Game Mirror - macOS installer/launcher.
 #
-#   curl -fsSL https://raw.githubusercontent.com/KiarTV/Discord-Quest/master/scripts/install.sh -o install.sh && chmod +x install.sh && ./install.sh
+#   curl -fsSL https://raw.githubusercontent.com/KiarTV/Discord-Quest/master/scripts/install.sh | bash
 #
 # Makes sure PowerShell 7 (pwsh) is available - installing it via Homebrew if
 # it isn't - then downloads and runs the actual tool (mirror.ps1). Re-running
-# this script always re-downloads mirror.ps1, so it doubles as an updater.
-# Any arguments are passed straight through to mirror.ps1, e.g.:
-#   ./install.sh -GameName "Roblox"
+# this always re-downloads mirror.ps1, so it doubles as an updater. Arguments
+# pass straight through to mirror.ps1 via `bash -s -- <args>`, e.g.:
+#   curl -fsSL .../install.sh | bash -s -- -GameName "Roblox"
+#
+# All status/log output below goes to stderr, on purpose: this script is
+# meant to be piped straight into `bash`, but if someone instead pastes it
+# wrapped in backticks or $(...) (easy to do by accident), stdout gets
+# captured and re-run as a command. Keeping stdout empty until the final
+# `exec pwsh` means that mistake fails quietly instead of surfacing a
+# second, misleading "command not found" error on top of the real one.
 
 set -euo pipefail
 
@@ -21,7 +28,7 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
 fi
 
 if ! command -v pwsh >/dev/null 2>&1; then
-    echo "PowerShell (pwsh) not found - installing via Homebrew..."
+    echo "PowerShell (pwsh) not found - installing via Homebrew..." >&2
     if ! command -v brew >/dev/null 2>&1; then
         echo "Homebrew is required to install pwsh automatically." >&2
         echo "Install it from https://brew.sh, then re-run this script." >&2
@@ -36,7 +43,7 @@ if ! command -v pwsh >/dev/null 2>&1; then
 fi
 
 mkdir -p "$CACHE_DIR"
-echo "Fetching mirror.ps1..."
+echo "Fetching mirror.ps1..." >&2
 curl -fsSL "$MIRROR_URL" -o "$MIRROR_SCRIPT"
 
 exec pwsh -NoProfile -File "$MIRROR_SCRIPT" "$@"
