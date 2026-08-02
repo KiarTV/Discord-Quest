@@ -26,6 +26,7 @@ the matching file under `src/` and run `.\build.ps1` to regenerate it, then
 commit both.
 
 ```
+scripts/install.sh            # macOS entrypoint (curl | chmod | run) - hand-maintained, not build.ps1 output
 src/
 ├── Main.Params.ps1          # param() block + top-level constants (must stay first — see build.ps1)
 ├── Main.Driver.ps1          # Show-Help, Invoke-QuestMirror, REPL/non-interactive driver (must stay last — calls everything else)
@@ -40,7 +41,15 @@ src/
     └── MacOS.ps1               # macOS-only mechanics (see below)
 ```
 
-`build.ps1` concatenates these files **in a fixed order** (defined in its
+`scripts/install.sh` is the macOS entrypoint referenced in the README's
+`curl -fsSL ... -o install.sh && chmod +x install.sh && ./install.sh` line.
+It's plain bash, hand-maintained (not something `build.ps1` produces): it
+installs `pwsh` via Homebrew if missing, downloads the latest `mirror.ps1`
+into `~/Library/Caches/quest-mirror/`, and execs it, passing through any
+arguments. Keep its `MIRROR_URL`/cache-path constants in sync with
+`Platform/MacOS.ps1`'s `Initialize-Platform-MacOS` if either changes.
+
+`build.ps1` concatenates the `src/` files **in a fixed order** (defined in its
 `$files` array) into `mirror.ps1`. Order matters for two reasons: PowerShell
 requires a script's `param()` block to be the first executable statement
 (only comments may precede it), so `Main.Params.ps1` must be emitted first;

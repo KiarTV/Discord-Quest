@@ -47,21 +47,27 @@ irm https://raw.githubusercontent.com/KiarTV/Discord-Quest/master/mirror.ps1 | i
 
 ### macOS
 
-Requires [PowerShell 7+](https://learn.microsoft.com/powershell/scripting/install/installing-powershell-on-macos)
-(`pwsh`), since Discord's public detectable-apps list and this script's
-process/window handling need it - macOS doesn't ship PowerShell by default.
+Run the installer from Terminal:
 
 ```bash
-brew install --cask powershell
+curl -fsSL https://raw.githubusercontent.com/KiarTV/Discord-Quest/master/scripts/install.sh -o install.sh && chmod +x install.sh && ./install.sh
 ```
 
-Then, straight from Terminal (no need to open `pwsh` first):
+It installs [PowerShell 7+](https://learn.microsoft.com/powershell/scripting/install/installing-powershell-on-macos)
+(`pwsh`) via [Homebrew](https://brew.sh) if it isn't already on your system
+(macOS doesn't ship PowerShell by default - it's required for Discord's
+detectable-apps handling and this script's process management), then
+downloads and runs `mirror.ps1`. Re-running `./install.sh` re-downloads the
+latest `mirror.ps1`, so it doubles as an update command. Arguments pass
+through to `mirror.ps1`, e.g. `./install.sh -GameName "Roblox"` for the
+non-interactive mode described below.
 
-```bash
-pwsh -c "irm https://raw.githubusercontent.com/KiarTV/Discord-Quest/master/mirror.ps1 | iex"
+If you already have `pwsh` installed and prefer the same one-liner style as
+Windows, that also works from inside `pwsh`:
+
+```powershell
+irm https://raw.githubusercontent.com/KiarTV/Discord-Quest/master/mirror.ps1 | iex
 ```
-
-Or open `pwsh` and run the same `irm ... | iex` line used on Windows.
 
 ### The prompt
 
