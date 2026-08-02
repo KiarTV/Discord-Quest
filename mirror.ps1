@@ -1,4 +1,4 @@
-﻿# =============================================================================
+# =============================================================================
 # GENERATED FILE - do not edit directly.
 # Source lives in src/ - run .\build.ps1 to regenerate this file, then
 # commit both. See CLAUDE.md for the module layout.

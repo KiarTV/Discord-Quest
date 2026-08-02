@@ -39,6 +39,15 @@ $parts = foreach ($f in $files) {
 }
 
 $output = $header + ($parts -join "`n`n") + "`n"
-Set-Content -Path (Join-Path $root 'mirror.ps1') -Value $output -NoNewline -Encoding utf8
+
+# Must be BOM-less: `irm <url> | iex` pipes the fetched text straight into
+# Invoke-Expression, which does NOT strip a leading BOM the way loading a
+# .ps1 file does. A BOM here glues to the "#" on line 1 so it's no longer
+# recognized as a comment start, and iex fails immediately trying to run it
+# as a command. Set-Content -Encoding utf8 writes a BOM in Windows
+# PowerShell 5.1 (unlike pwsh 7+, where "utf8" means no-BOM) - write via
+# .NET directly instead so this is BOM-less on both editions.
+$outputPath = Join-Path $root 'mirror.ps1'
+[System.IO.File]::WriteAllText($outputPath, $output, (New-Object System.Text.UTF8Encoding($false)))
 
 Write-Host "Built mirror.ps1 from $($files.Count) source files."
