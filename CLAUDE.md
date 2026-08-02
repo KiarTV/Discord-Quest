@@ -171,7 +171,13 @@ for filtering executables by `$script:AppOsKey`:
 
 **`Common/Queue.ps1`** — only one mirror runs at a time; anything requested
 while one is active goes into `$script:MirrorQueue` (a FIFO) and auto-starts
-via `Invoke-QueuePump` once the active mirror exits.
+via `Invoke-QueuePump` once the active mirror exits. `Stop-Mirror` (`/stop
+<name>`) matches against both the running process *and* the queue - a
+queued-but-not-yet-started game is a real, user-visible state (shown in
+`/status`), so it needs to be cancelable by name too, not just the one
+currently running. `Stop-AllMirrors` (`/stop all`) stops the running mirror
+and clears the whole queue via `.Clear()`; don't let it drift back to only
+handling the active process, since with the queue that's no longer "all."
 
 **`Common/InputLoop.ps1`** — `Read-MirrorCommand` is a custom key-by-key
 input loop (not `Read-Host`) — this is deliberate, because `Read-Host` blocks

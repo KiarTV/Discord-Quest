@@ -8,9 +8,9 @@ function Show-Help {
     Write-Host "  Commands" -ForegroundColor DarkCyan
     Write-Host "    <game name>       start a mirror, or queue it if one's already running" -ForegroundColor Gray
     Write-Host "    <game name> --pick   choose which executable to use, if the first didn't work" -ForegroundColor Gray
-    Write-Host "    /status           list active mirrors and the queue" -ForegroundColor Gray
-    Write-Host "    /stop <game name> stop one mirror (Tab to autocomplete)" -ForegroundColor Gray
-    Write-Host "    /stop all         stop every active mirror" -ForegroundColor Gray
+    Write-Host "    /status           show the running mirror and the queue" -ForegroundColor Gray
+    Write-Host "    /stop <game name> stop it if running, or cancel it if queued (Tab to autocomplete)" -ForegroundColor Gray
+    Write-Host "    /stop all         stop the running mirror and clear the queue" -ForegroundColor Gray
     Write-Host "    /help             show this list" -ForegroundColor Gray
     Write-Host "    /exit             quit (or just press Enter)" -ForegroundColor Gray
     Write-Host ""
@@ -133,5 +133,5 @@ if ($GameName) {
     if ($script:MirrorQueue.Count -gt 0) {
         Write-Warn2 "$($script:MirrorQueue.Count) queued game(s) will NOT start - the queue only advances while this window is open"
     }
-    Write-Meta "Bye - active mirrors keep running until they expire or you /stop them."
+    Write-Meta "Bye - a running mirror keeps going until it expires or you /stop it."
 }

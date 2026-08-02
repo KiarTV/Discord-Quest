@@ -58,30 +58,23 @@ irm https://raw.githubusercontent.com/KiarTV/Discord-Quest/master/mirror.ps1 | i
 
 ### The prompt
 
-Either platform lands you in a small prompt (`quest-mirror >`). Type a game
-name to queue a mirror for it - each one launches as its own process, so you
-can queue several games in parallel. Slash commands handle everything else:
+Either platform lands you in a small prompt (`quest-mirror >`). Only one
+mirror actually runs at a time; type a game name to start one, or to queue it
+if another is already running - queued games start automatically, one after
+another, as each earlier one finishes. Slash commands handle everything else:
 
-| Command             | What it does                        |
-| -------------------- | ------------------------------------ |
-| `<game name>`         | queue a mirror for that game         |
-| `/status`             | list active mirrors and expiry times |
-| `/stop <exe name>`    | stop one mirror                      |
-| `/stop all`           | stop every active mirror             |
-| `/help`               | show the command list                |
-| `/exit` (or blank)    | quit - active mirrors keep running   |
+| Command             | What it does                                    |
+| -------------------- | ------------------------------------------------ |
+| `<game name>`         | start a mirror, or queue it if one's running      |
+| `/status`             | show the running mirror and the queue             |
+| `/stop <game name>`   | stop it if running, or cancel it if queued        |
+| `/stop all`           | stop the running mirror and clear the queue       |
+| `/help`               | show the command list                             |
+| `/exit` (or blank)    | quit - the running mirror keeps going             |
 
 If a game has more than one possible executable, add `--pick` to the game
 name to choose which one to use, e.g. `Apex Legends --pick`.
 
-### Skipping the prompt
-
-You can also start a mirror directly from the command line instead of using
-the interactive prompt:
-
-```powershell
-.\mirror.ps1 -GameName "Roblox"
-```
 
 ## Notes
 

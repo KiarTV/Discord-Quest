@@ -652,34 +652,67 @@ function Test-MirrorActive {
     return [bool](Get-ActiveMirrorProcesses)
 }
 
+function Remove-QueuedMirror {
+    param([string]$ExeName)
+    $kept = New-Object System.Collections.Generic.Queue[object]
+    foreach ($item in $script:MirrorQueue.ToArray()) {
+        if ($item.ExeName -ne $ExeName) { $kept.Enqueue($item) }
+    }
+    $script:MirrorQueue = $kept
+}
+
+# Only one mirror is ever actually running, but /stop needs to reach a
+# queued-and-not-yet-started game too - "queued" is a real, user-visible
+# state (shown in /status), not an implementation detail, so a queued game
+# should be cancelable by name just like a running one.
 function Stop-Mirror {
     param([string]$Query)
 
-    $active = @(Get-ActiveMirrorInfo)
-    $matched = @($active | Where-Object { $_.DisplayName -eq $Query -or $_.ExeName -eq $Query })
+    $active = @(Get-ActiveMirrorInfo | ForEach-Object {
+        [PSCustomObject]@{ Kind = 'Active'; DisplayName = $_.DisplayName; ExeName = $_.ExeName; Process = $_.Process }
+    })
+    $queued = @($script:MirrorQueue.ToArray() | ForEach-Object {
+        [PSCustomObject]@{ Kind = 'Queued'; DisplayName = $_.DisplayName; ExeName = $_.ExeName }
+    })
+    $all = $active + $queued
+
+    $matched = @($all | Where-Object { $_.DisplayName -eq $Query -or $_.ExeName -eq $Query })
     if ($matched.Count -eq 0) {
-        $matched = @($active | Where-Object { $_.DisplayName -like "*$Query*" -or $_.ExeName -like "*$Query*" })
+        $matched = @($all | Where-Object { $_.DisplayName -like "*$Query*" -or $_.ExeName -like "*$Query*" })
     }
 
     if ($matched.Count -eq 0) {
-        Write-Warn2 "No running mirror matching '$Query' found"
+        Write-Warn2 "No running or queued mirror matching '$Query' found"
         return
     }
     foreach ($m in $matched) {
-        Stop-Process -Id $m.Process.Id -Force
-        Write-Ok "Stopped $($m.DisplayName) (PID $($m.Process.Id))"
+        if ($m.Kind -eq 'Active') {
+            Stop-Process -Id $m.Process.Id -Force
+            Write-Ok "Stopped $($m.DisplayName) (PID $($m.Process.Id))"
+        } else {
+            Remove-QueuedMirror -ExeName $m.ExeName
+            Write-Ok "Removed `"$($m.DisplayName)`" from the queue"
+        }
     }
 }
 
 function Stop-AllMirrors {
     $active = @(Get-ActiveMirrorInfo)
-    if ($active.Count -eq 0) {
-        Write-Warn2 "No active mirrors to stop"
+    $queuedCount = $script:MirrorQueue.Count
+
+    if ($active.Count -eq 0 -and $queuedCount -eq 0) {
+        Write-Warn2 "No active or queued mirrors to stop"
         return
     }
+
     foreach ($m in $active) {
         Stop-Process -Id $m.Process.Id -Force
         Write-Ok "Stopped $($m.DisplayName) (PID $($m.Process.Id))"
+    }
+
+    if ($queuedCount -gt 0) {
+        $script:MirrorQueue.Clear()
+        Write-Ok "Cleared $queuedCount queued mirror$(if ($queuedCount -ne 1) { 's' })"
     }
 }
 
@@ -720,7 +753,9 @@ function Invoke-QueuePump {
 function Get-StopCandidates {
     param([string]$Typed)
 
-    $names = @((Get-ActiveMirrorInfo | ForEach-Object { $_.DisplayName }) + 'all') | Select-Object -Unique
+    $activeNames = Get-ActiveMirrorInfo | ForEach-Object { $_.DisplayName }
+    $queuedNames = $script:MirrorQueue.ToArray() | ForEach-Object { $_.DisplayName }
+    $names = @($activeNames + $queuedNames + 'all') | Select-Object -Unique
     return @($names | Where-Object { $_.ToLowerInvariant().StartsWith($Typed.ToLowerInvariant()) })
 }
 
@@ -1098,9 +1133,9 @@ function Show-Help {
     Write-Host "  Commands" -ForegroundColor DarkCyan
     Write-Host "    <game name>       start a mirror, or queue it if one's already running" -ForegroundColor Gray
     Write-Host "    <game name> --pick   choose which executable to use, if the first didn't work" -ForegroundColor Gray
-    Write-Host "    /status           list active mirrors and the queue" -ForegroundColor Gray
-    Write-Host "    /stop <game name> stop one mirror (Tab to autocomplete)" -ForegroundColor Gray
-    Write-Host "    /stop all         stop every active mirror" -ForegroundColor Gray
+    Write-Host "    /status           show the running mirror and the queue" -ForegroundColor Gray
+    Write-Host "    /stop <game name> stop it if running, or cancel it if queued (Tab to autocomplete)" -ForegroundColor Gray
+    Write-Host "    /stop all         stop the running mirror and clear the queue" -ForegroundColor Gray
     Write-Host "    /help             show this list" -ForegroundColor Gray
     Write-Host "    /exit             quit (or just press Enter)" -ForegroundColor Gray
     Write-Host ""
@@ -1223,5 +1258,5 @@ if ($GameName) {
     if ($script:MirrorQueue.Count -gt 0) {
         Write-Warn2 "$($script:MirrorQueue.Count) queued game(s) will NOT start - the queue only advances while this window is open"
     }
-    Write-Meta "Bye - active mirrors keep running until they expire or you /stop them."
+    Write-Meta "Bye - a running mirror keeps going until it expires or you /stop it."
 }
