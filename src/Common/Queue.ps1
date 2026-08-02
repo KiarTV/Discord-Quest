@@ -6,15 +6,39 @@
 # ---------------------------------------------------------------------------
 
 function Get-ActiveMirrorProcesses {
-    return Get-Process | Where-Object { $_.Path -and $_.Path.StartsWith($script:MirrorsDir, [StringComparison]::OrdinalIgnoreCase) }
+    # $_.Path re-queries live OS process info on every access rather than
+    # returning a cached value, and this runs on every idle poll tick over
+    # the *entire* system process list - if a process exits between two
+    # separate $_.Path accesses (e.g. right after a /stop, or just normal
+    # system churn), the first access can return a valid path while a
+    # second one moments later returns null or throws. Capture it once, and
+    # never let one uncooperative process take down the whole polling loop -
+    # confirmed live: this exact race crashed the interactive prompt.
+    return Get-Process | Where-Object {
+        try {
+            $path = $_.Path
+            $path -and $path.StartsWith($script:MirrorsDir, [StringComparison]::OrdinalIgnoreCase)
+        } catch {
+            $false
+        }
+    }
 }
 
 function Get-ActiveMirrorInfo {
     Get-ActiveMirrorProcesses | ForEach-Object {
-        $exeName = Split-Path $_.Path -Leaf
-        $displayName = $script:MirrorNameMap[$exeName]
-        if (-not $displayName) { $displayName = $exeName }
-        [PSCustomObject]@{ Process = $_; ExeName = $exeName; DisplayName = $displayName }
+        # Same live-query race as Get-ActiveMirrorProcesses above: $_.Path
+        # already succeeded once when this process passed that filter, but
+        # it's queried again here in a separate pipeline stage moments
+        # later, and the process can have exited in between. Skip it rather
+        # than crash - if it's still actually running, the next poll picks
+        # it back up.
+        try {
+            $exeName = Split-Path $_.Path -Leaf
+            $displayName = $script:MirrorNameMap[$exeName]
+            if (-not $displayName) { $displayName = $exeName }
+            [PSCustomObject]@{ Process = $_; ExeName = $exeName; DisplayName = $displayName }
+        } catch {
+        }
     }
 }
 

@@ -113,7 +113,13 @@ function Start-DeElevated {
         $proc = $null
         while ((Get-Date) -lt $deadline -and -not $proc) {
             Start-Sleep -Milliseconds 300
-            $proc = Get-Process | Where-Object { $_.Path -eq $FilePath } | Select-Object -First 1
+            # .Path can throw for processes that exit mid-scan (see the
+            # matching comment on Get-ActiveMirrorProcesses in Queue.ps1) -
+            # this scans every system process on each retry, so it needs
+            # the same guard to keep retrying instead of crashing out.
+            $proc = Get-Process | Where-Object {
+                try { $_.Path -eq $FilePath } catch { $false }
+            } | Select-Object -First 1
         }
         return $proc
     } finally {
