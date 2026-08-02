@@ -228,6 +228,12 @@ function Start-Mirror {
     return Start-Mirror-MacOS -ExePath $ExePath
 }
 
+function Stop-MirrorProcess {
+    param([int]$ProcessId)
+    if ($script:PlatformOS -eq 'win32') { Stop-MirrorProcess-Windows -ProcessId $ProcessId; return }
+    Stop-MirrorProcess-MacOS -ProcessId $ProcessId
+}
+
 # --- src/Platform/Windows.ps1 ----------------------------------------------
 # ---------------------------------------------------------------------------
 # Windows implementation - stub is a renamed copy of cmd.exe, kept alive via
@@ -412,6 +418,25 @@ function Start-Mirror-Windows {
     return [PSCustomObject]@{ Id = $proc.Id; Alive = $alive }
 }
 
+function Stop-MirrorProcess-Windows {
+    param([int]$ProcessId)
+
+    # The mirror stub is a renamed cmd.exe running `/c timeout ...` -
+    # timeout.exe runs as a CHILD of that process, sharing its console.
+    # Stop-Process on just the tracked PID doesn't cascade to children, so
+    # timeout.exe (and the console/window it's still attached to) keeps
+    # running for whatever's left of its ~17.5 minutes - and it's invisible
+    # to /status the whole time, since its own Path is
+    # System32\timeout.exe, not under $script:MirrorsDir. Confirmed via a
+    # live report of exactly this: /stop reported success, but the process
+    # was still running afterward.
+    $children = Get-CimInstance Win32_Process -Filter "ParentProcessId=$ProcessId" -ErrorAction SilentlyContinue
+    foreach ($child in $children) {
+        Stop-Process -Id $child.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+    Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+}
+
 # --- src/Platform/MacOS.ps1 ------------------------------------------------
 # ---------------------------------------------------------------------------
 # macOS implementation - UNVERIFIED against Discord's real Quest detection.
@@ -478,6 +503,13 @@ function Start-Mirror-MacOS {
     }
 
     return [PSCustomObject]@{ Id = $proc.Id; Alive = $alive }
+}
+
+function Stop-MirrorProcess-MacOS {
+    param([int]$ProcessId)
+    # Unlike Windows' cmd.exe-wrapped stub, /bin/sleep never spawns a child
+    # process, so there's nothing else to clean up here.
+    Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
 }
 
 # --- src/Common/Discovery.ps1 ----------------------------------------------
@@ -687,7 +719,7 @@ function Stop-Mirror {
     }
     foreach ($m in $matched) {
         if ($m.Kind -eq 'Active') {
-            Stop-Process -Id $m.Process.Id -Force
+            Stop-MirrorProcess -ProcessId $m.Process.Id
             Write-Ok "Stopped $($m.DisplayName) (PID $($m.Process.Id))"
         } else {
             Remove-QueuedMirror -ExeName $m.ExeName
@@ -706,7 +738,7 @@ function Stop-AllMirrors {
     }
 
     foreach ($m in $active) {
-        Stop-Process -Id $m.Process.Id -Force
+        Stop-MirrorProcess -ProcessId $m.Process.Id
         Write-Ok "Stopped $($m.DisplayName) (PID $($m.Process.Id))"
     }
 

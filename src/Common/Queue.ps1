@@ -57,7 +57,7 @@ function Stop-Mirror {
     }
     foreach ($m in $matched) {
         if ($m.Kind -eq 'Active') {
-            Stop-Process -Id $m.Process.Id -Force
+            Stop-MirrorProcess -ProcessId $m.Process.Id
             Write-Ok "Stopped $($m.DisplayName) (PID $($m.Process.Id))"
         } else {
             Remove-QueuedMirror -ExeName $m.ExeName
@@ -76,7 +76,7 @@ function Stop-AllMirrors {
     }
 
     foreach ($m in $active) {
-        Stop-Process -Id $m.Process.Id -Force
+        Stop-MirrorProcess -ProcessId $m.Process.Id
         Write-Ok "Stopped $($m.DisplayName) (PID $($m.Process.Id))"
     }
 

@@ -126,8 +126,9 @@ platform implementation handles a call. `Get-PlatformOS` detects
 supported). `Initialize-Platform` calls `Initialize-Platform-Windows` or
 `-MacOS`, which each set `$script:CacheDir`, `$script:MirrorsDir`,
 `$script:StubSource`, and `$script:AppOsKey` (the `"os"` value Discord's
-detectable-apps executables list uses for this platform). `Deploy-Stub` and
-`Start-Mirror` are dispatchers with the same pattern.
+detectable-apps executables list uses for this platform). `Deploy-Stub`,
+`Start-Mirror`, and `Stop-MirrorProcess` are dispatchers with the same
+pattern.
 
 **`Platform/Windows.ps1`** and **`Platform/MacOS.ps1`** hold the concrete,
 platform-specific mechanics. Because this all ends up concatenated into one
@@ -146,6 +147,19 @@ platform's implementation.
   the script itself runs elevated: UIPI blocks a standard-integrity Discord
   process from seeing an elevated one, so the launch is handed to a
   temporary Limited-rights scheduled task instead of being spawned directly.
+  `Stop-MirrorProcess-Windows` kills the tracked PID's children (found via
+  `Win32_Process -Filter "ParentProcessId=..."`) before the PID itself —
+  `cmd.exe /c timeout ...` runs `timeout.exe` as a *child* process sharing
+  the same console, and `Stop-Process` doesn't cascade to children, so
+  killing only the tracked PID left `timeout.exe` (and the console it was
+  attached to) running for whatever was left of its ~17.5 minutes,
+  invisible to `/status` the whole time since its own `Path` is
+  `System32\timeout.exe`, not under `$script:MirrorsDir`. Confirmed via a
+  live report of exactly this symptom (`/stop` reported success, process
+  kept running) before this was added — verify any future change here by
+  actually launching a mirror, checking `Win32_Process` for its children,
+  stopping it, and confirming zero PIDs survive, not just that the script
+  parses.
 - *macOS*: stub is a renamed copy of `/bin/sleep` (which already accepts a
   duration and exits on its own, so unlike Windows there's no wrapper
   command needed), run as a plain background process with no window-hiding

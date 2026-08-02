@@ -64,3 +64,10 @@ function Start-Mirror-MacOS {
 
     return [PSCustomObject]@{ Id = $proc.Id; Alive = $alive }
 }
+
+function Stop-MirrorProcess-MacOS {
+    param([int]$ProcessId)
+    # Unlike Windows' cmd.exe-wrapped stub, /bin/sleep never spawns a child
+    # process, so there's nothing else to clean up here.
+    Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+}

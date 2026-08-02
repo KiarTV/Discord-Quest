@@ -180,3 +180,22 @@ function Start-Mirror-Windows {
 
     return [PSCustomObject]@{ Id = $proc.Id; Alive = $alive }
 }
+
+function Stop-MirrorProcess-Windows {
+    param([int]$ProcessId)
+
+    # The mirror stub is a renamed cmd.exe running `/c timeout ...` -
+    # timeout.exe runs as a CHILD of that process, sharing its console.
+    # Stop-Process on just the tracked PID doesn't cascade to children, so
+    # timeout.exe (and the console/window it's still attached to) keeps
+    # running for whatever's left of its ~17.5 minutes - and it's invisible
+    # to /status the whole time, since its own Path is
+    # System32\timeout.exe, not under $script:MirrorsDir. Confirmed via a
+    # live report of exactly this: /stop reported success, but the process
+    # was still running afterward.
+    $children = Get-CimInstance Win32_Process -Filter "ParentProcessId=$ProcessId" -ErrorAction SilentlyContinue
+    foreach ($child in $children) {
+        Stop-Process -Id $child.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+    Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+}

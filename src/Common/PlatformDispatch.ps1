@@ -48,3 +48,9 @@ function Start-Mirror {
     if ($script:PlatformOS -eq 'win32') { return Start-Mirror-Windows -ExePath $ExePath }
     return Start-Mirror-MacOS -ExePath $ExePath
 }
+
+function Stop-MirrorProcess {
+    param([int]$ProcessId)
+    if ($script:PlatformOS -eq 'win32') { Stop-MirrorProcess-Windows -ProcessId $ProcessId; return }
+    Stop-MirrorProcess-MacOS -ProcessId $ProcessId
+}
