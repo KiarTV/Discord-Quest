@@ -1,11 +1,21 @@
+﻿# =============================================================================
+# GENERATED FILE - do not edit directly.
+# Source lives in src/ - run .\build.ps1 to regenerate this file, then
+# commit both. See CLAUDE.md for the module layout.
+# =============================================================================
+# --- src/Main.Params.ps1 ---------------------------------------------------
 # Discord Quest Game Mirror
 # Interactive: irm https://raw.githubusercontent.com/KiarTV/Discord-Quest/master/mirror.ps1 | iex
 # Non-interactive (scripting/testing): .\mirror.ps1 -GameName "Roblox" -ExeChoice 2
 #
-# Resolves a raw game name to the exact .exe filename Discord's Quest detection
-# looks for, then launches a renamed copy of a harmless stub executable so a
-# process with that image name is running. Only affects your own local
-# Discord client's Quest progress detection - no network/account tampering.
+# Resolves a raw game name to the exact executable name Discord's Quest
+# detection looks for, then launches a renamed copy of a harmless stub
+# process so a process with that image name is running. Only affects your
+# own local Discord client's Quest progress detection - no network/account
+# tampering.
+#
+# Runs on Windows (PowerShell 5.1+) and macOS (PowerShell 7+/pwsh - see
+# README for the macOS caveats before relying on this).
 
 param(
     [string]$GameName,
@@ -14,26 +24,31 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$CacheDir = Join-Path $env:LOCALAPPDATA 'quest-mirror'
-$CacheFile = Join-Path $CacheDir 'detectable_apps.json'
-$MirrorsDir = Join-Path $CacheDir 'mirrors'
-$CacheMaxAgeHours = 24
-$StubSource = Join-Path $env:WINDIR 'System32\cmd.exe'
 $MirrorDurationSeconds = [int](17.5 * 60)
-$Version = '1.0.0'
+$CacheMaxAgeHours = 24
+$Version = '2.0.0'
 
 # FIFO of games waiting for the currently running mirror to finish - only one
 # mirror runs at a time, so anything requested while one is active gets
 # queued here instead of launching immediately.
 $script:MirrorQueue = New-Object System.Collections.Generic.Queue[object]
 
+# exeName -> game display name, recorded whenever a mirror launches, so
+# /stop and /status can work in terms of the game's name instead of its
+# renamed stub filename.
+$script:MirrorNameMap = @{}
+
+# --- src/Common/UI.ps1 -----------------------------------------------------
 # ---------------------------------------------------------------------------
-# UI kit
+# UI kit - console output helpers, banner, spinner, and the cross-platform
+# VT/ANSI enable step everything below (InputLoop.ps1's completion menu)
+# depends on.
 # ---------------------------------------------------------------------------
 
 $script:Glyph = @{ Ok = [char]0x2713; Warn = [char]0x26A0; Err = [char]0x2717; Step = [char]0x25B8 }
 
 $script:HRule = [char]0x2500
+$script:Esc = [char]27
 
 function Write-Divider { Write-Host (([string]$script:HRule) * 46) -ForegroundColor DarkGray }
 
@@ -42,13 +57,13 @@ function Write-Divider { Write-Host (([string]$script:HRule) * 46) -ForegroundCo
 # encoding. Each letter is a 6-row array; widths verified to line up.
 function J { param([int[]]$Codes) -join ($Codes | ForEach-Object { [char]$_ }) }
 
-$FBc = 0x2588  # █
-$V   = 0x2551  # ║
-$UR  = 0x2557  # ╗  (down+left)
-$UL  = 0x2554  # ╔  (down+right)
-$LR  = 0x255D  # ╝  (up+left)
-$LL  = 0x255A  # ╚  (up+right)
-$H   = 0x2550  # ═
+$FBc = 0x2588  # â–ˆ
+$V   = 0x2551  # â•‘
+$UR  = 0x2557  # â•—  (down+left)
+$UL  = 0x2554  # â•”  (down+right)
+$LR  = 0x255D  # â•  (up+left)
+$LL  = 0x255A  # â•š  (up+right)
+$H   = 0x2550  # â•
 $SP  = 0x0020
 
 $script:BigLetters = @{
@@ -134,26 +149,358 @@ function Invoke-WithSpinner {
     return $result
 }
 
+# Cached tri-state ($null = not probed yet). Enabling VT lets the /stop
+# completion menu draw real rows below the prompt using only *relative*
+# ANSI cursor moves (save/restore, next-line, line-clear) - unlike
+# [Console]::CursorTop/SetCursorPosition, those aren't the ones that desync
+# from the real cursor under Windows Terminal's ConPTY translation layer
+# (see the comment on Read-MirrorCommand in InputLoop.ps1 for why that
+# matters here). Any failure leaves $script:UseMenu false for the whole
+# session and the original single-line ghost-text path runs unchanged.
+$script:VtEnabled = $null
+
+function Enable-VirtualTerminal {
+    if ($null -ne $script:VtEnabled) { return $script:VtEnabled }
+    if ([Console]::IsOutputRedirected) { $script:VtEnabled = $false; return $false }
+
+    if ($script:PlatformOS -eq 'win32') {
+        # Windows consoles need ENABLE_VIRTUAL_TERMINAL_PROCESSING flipped on
+        # explicitly - see Platform/Windows.ps1.
+        $script:VtEnabled = Enable-VirtualTerminal-Windows
+    } else {
+        # Unix terminals (Terminal.app, iTerm2, and effectively everything
+        # else macOS/Linux users run) interpret ANSI/VT sequences natively -
+        # there's no console-mode flag to flip the way Windows needs one.
+        $script:VtEnabled = $true
+    }
+    return $script:VtEnabled
+}
+
+# --- src/Common/PlatformDispatch.ps1 ---------------------------------------
 # ---------------------------------------------------------------------------
-# Core logic
+# Platform detection & dispatch - the only place that decides whether
+# Platform/Windows.ps1 or Platform/MacOS.ps1 handles a given call. Both
+# platform files are always loaded (this ships as one bundled script), so
+# every platform-specific function is suffixed -Windows / -MacOS and is
+# never called directly outside this dispatch layer.
+# ---------------------------------------------------------------------------
+
+function Get-PlatformOS {
+    if ($PSVersionTable.PSVersion.Major -ge 6) {
+        if ($IsMacOS) { return 'darwin' }
+        if ($IsWindows) { return 'win32' }
+        return 'linux'
+    }
+    # Windows PowerShell 5.1 (no $IsWindows/$IsMacOS) only ever runs on Windows.
+    return 'win32'
+}
+
+# Sets $script:CacheDir, $script:CacheFile, $script:MirrorsDir,
+# $script:StubSource and $script:AppOsKey (the "os" value Discord's
+# detectable-apps executables list uses for this platform - 'win32' or
+# 'darwin') by delegating to the matching Initialize-Platform-* function.
+function Initialize-Platform {
+    $script:PlatformOS = Get-PlatformOS
+
+    switch ($script:PlatformOS) {
+        'win32'  { Initialize-Platform-Windows }
+        'darwin' { Initialize-Platform-MacOS }
+        default {
+            Write-Host "quest-mirror only supports Windows and macOS right now (detected: $script:PlatformOS)." -ForegroundColor Red
+            exit 1
+        }
+    }
+
+    if (-not (Test-Path $script:CacheDir)) {
+        New-Item -ItemType Directory -Path $script:CacheDir -Force | Out-Null
+    }
+}
+
+function Deploy-Stub {
+    param([string]$ExeName)
+    if ($script:PlatformOS -eq 'win32') { return Deploy-Stub-Windows -ExeName $ExeName }
+    return Deploy-Stub-MacOS -ExeName $ExeName
+}
+
+function Start-Mirror {
+    param([string]$ExePath)
+    if ($script:PlatformOS -eq 'win32') { return Start-Mirror-Windows -ExePath $ExePath }
+    return Start-Mirror-MacOS -ExePath $ExePath
+}
+
+# --- src/Platform/Windows.ps1 ----------------------------------------------
+# ---------------------------------------------------------------------------
+# Windows implementation - stub is a renamed copy of cmd.exe, kept alive via
+# `timeout`, moved off-screen (not minimized) so Discord's window-owning
+# process scan still counts it as running.
+# ---------------------------------------------------------------------------
+
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class QuestMirrorNative {
+    [DllImport("user32.dll")]
+    public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+}
+"@
+
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class QuestMirrorConsole {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr GetStdHandle(int nStdHandle);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+}
+"@
+
+function Enable-VirtualTerminal-Windows {
+    try {
+        $STD_OUTPUT_HANDLE = -11
+        $ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+        $h = [QuestMirrorConsole]::GetStdHandle($STD_OUTPUT_HANDLE)
+        if ($h -eq [IntPtr]::Zero) { return $false }
+        $mode = 0
+        if (-not [QuestMirrorConsole]::GetConsoleMode($h, [ref]$mode)) { return $false }
+        if (($mode -band $ENABLE_VIRTUAL_TERMINAL_PROCESSING) -eq 0) {
+            if (-not [QuestMirrorConsole]::SetConsoleMode($h, ($mode -bor $ENABLE_VIRTUAL_TERMINAL_PROCESSING))) { return $false }
+        }
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Find-MirrorWindowHandle {
+    param([int]$ProcessId, [string]$ExeName)
+
+    # The renamed process itself, a classic conhost.exe child, or - on
+    # machines where Windows Terminal is the default terminal app - a
+    # WindowsTerminal.exe window can each end up owning the actual HWND,
+    # so all three have to be checked (confirmed via live testing).
+    $deadline = (Get-Date).AddSeconds(6)
+    while ((Get-Date) -lt $deadline) {
+        $proc = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+        if ($proc -and $proc.MainWindowHandle -ne [IntPtr]::Zero) { return $proc.MainWindowHandle }
+
+        $conhosts = Get-CimInstance Win32_Process -Filter "ParentProcessId=$ProcessId AND Name='conhost.exe'" -ErrorAction SilentlyContinue
+        foreach ($c in $conhosts) {
+            $chProc = Get-Process -Id $c.ProcessId -ErrorAction SilentlyContinue
+            if ($chProc -and $chProc.MainWindowHandle -ne [IntPtr]::Zero) { return $chProc.MainWindowHandle }
+        }
+
+        $wt = Get-Process WindowsTerminal -ErrorAction SilentlyContinue |
+            Where-Object { $_.MainWindowTitle -like "*$ExeName*" -and $_.MainWindowHandle -ne [IntPtr]::Zero } |
+            Select-Object -First 1
+        if ($wt) { return $wt.MainWindowHandle }
+
+        Start-Sleep -Milliseconds 300
+    }
+    return [IntPtr]::Zero
+}
+
+function Hide-MirrorWindow {
+    param([int]$ProcessId, [string]$ExeName)
+
+    $hwnd = Find-MirrorWindowHandle -ProcessId $ProcessId -ExeName $ExeName
+    if ($hwnd -eq [IntPtr]::Zero) {
+        Write-Warn2 "Couldn't locate the mirror's window to hide it - it may briefly flash on screen"
+        return
+    }
+    # SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE. The window stays in its
+    # normal (restored) state - Discord only counts the mirror as running
+    # while it's not minimized - just relocated off every monitor.
+    [QuestMirrorNative]::SetWindowPos($hwnd, [IntPtr]::Zero, -32000, -32000, 0, 0, 0x15) | Out-Null
+}
+
+function Test-IsElevated {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    return (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Start-DeElevated {
+    param([string]$FilePath, [string]$Arguments)
+
+    # A standard-integrity Discord process can't properly see into a
+    # higher-integrity (elevated) one - UIPI blocks it. If this script is
+    # running elevated, the stub must still launch at standard integrity, so
+    # hand the launch to a Limited-rights scheduled task instead of spawning
+    # it directly (which would inherit our elevated token).
+    $escapedPath = $FilePath.Replace("'", "''")
+    $escapedArgs = $Arguments.Replace("'", "''")
+    $inner = "Start-Process -FilePath '$escapedPath' -ArgumentList '$escapedArgs' -WindowStyle Normal"
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($inner))
+
+    $taskName = "QuestMirror_$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -WindowStyle Hidden -EncodedCommand $encoded"
+    $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -RunLevel Limited
+    Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Force | Out-Null
+    try {
+        Start-ScheduledTask -TaskName $taskName
+        $deadline = (Get-Date).AddSeconds(5)
+        $proc = $null
+        while ((Get-Date) -lt $deadline -and -not $proc) {
+            Start-Sleep -Milliseconds 300
+            $proc = Get-Process | Where-Object { $_.Path -eq $FilePath } | Select-Object -First 1
+        }
+        return $proc
+    } finally {
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    }
+}
+
+function Initialize-Platform-Windows {
+    $script:CacheDir = Join-Path $env:LOCALAPPDATA 'quest-mirror'
+    $script:CacheFile = Join-Path $script:CacheDir 'detectable_apps.json'
+    $script:MirrorsDir = Join-Path $script:CacheDir 'mirrors'
+    $script:StubSource = Join-Path $env:WINDIR 'System32\cmd.exe'
+    $script:AppOsKey = 'win32'
+}
+
+function Deploy-Stub-Windows {
+    param([string]$ExeName)
+
+    if (-not (Test-Path $script:MirrorsDir)) {
+        New-Item -ItemType Directory -Path $script:MirrorsDir -Force | Out-Null
+    }
+    if (-not (Test-Path $script:StubSource)) {
+        throw "Stub source not found: $script:StubSource"
+    }
+
+    $target = Join-Path $script:MirrorsDir $ExeName
+    Copy-Item -Path $script:StubSource -Destination $target -Force
+    return $target
+}
+
+function Start-Mirror-Windows {
+    param([string]$ExePath)
+
+    # Discord only counts the mirror as running while its window is in a
+    # normal (restored) state - Minimized reads as not-running (confirmed
+    # via live testing). So launch visibly, then move the window off every
+    # monitor instead of minimizing it.
+    $seconds = [int]$MirrorDurationSeconds
+    $mirrorArgs = "/c timeout /t $seconds /nobreak >nul"
+    $exeName = Split-Path $ExePath -Leaf
+
+    if (Test-IsElevated) {
+        Write-Meta "Running elevated - launching mirror at standard integrity so Discord can see it"
+        $proc = Start-DeElevated -FilePath $ExePath -Arguments $mirrorArgs
+        if (-not $proc) {
+            Write-Err2 "De-elevated launch didn't produce a matching process in time"
+            return [PSCustomObject]@{ Id = $null; Alive = $false }
+        }
+    } else {
+        $proc = Start-Process -FilePath $ExePath -ArgumentList $mirrorArgs -WindowStyle Normal -PassThru
+    }
+
+    Hide-MirrorWindow -ProcessId $proc.Id -ExeName $exeName
+
+    Start-Sleep -Milliseconds 1200
+    $alive = $false
+    try { $alive = -not (Get-Process -Id $proc.Id -ErrorAction Stop).HasExited } catch { $alive = $false }
+
+    if (-not $alive) {
+        Write-Err2 "Process exited immediately after launch (PID $($proc.Id) is gone)"
+        Write-Meta "Likely cause: antivirus killing a renamed system exe on sight"
+        Write-Meta "Check Windows Security -> Protection history, then exclude: $script:MirrorsDir"
+    }
+
+    return [PSCustomObject]@{ Id = $proc.Id; Alive = $alive }
+}
+
+# --- src/Platform/MacOS.ps1 ------------------------------------------------
+# ---------------------------------------------------------------------------
+# macOS implementation - UNVERIFIED against Discord's real Quest detection.
+#
+# The Windows half of this script works because Discord's Windows detector
+# enumerates top-level windows and matches the owning process' image name -
+# confirmed by live testing against real Quests. Discord's macOS detector is
+# a different, closed-source code path, and nobody involved in this repo has
+# confirmed exactly what it keys on (running process name via ps/libproc?
+# the app bundle's CFBundleIdentifier from Info.plist? something else?).
+#
+# This implementation takes the most likely guess given how the Windows side
+# behaves: a running process whose name matches the executable name from
+# Discord's detectable-apps list. It deliberately does NOT try to fake a
+# window - a bare CLI process has no window at all, and unlike Windows,
+# nothing suggests Discord's Mac client requires one.
+#
+# If a mirror doesn't get picked up as a running game on your machine,
+# that's useful signal either way - please open an issue with what you
+# tried and whether Quest progress moved.
+# ---------------------------------------------------------------------------
+
+function Initialize-Platform-MacOS {
+    $script:CacheDir = Join-Path $HOME 'Library/Caches/quest-mirror'
+    $script:CacheFile = Join-Path $script:CacheDir 'detectable_apps.json'
+    $script:MirrorsDir = Join-Path $script:CacheDir 'mirrors'
+    # /bin/sleep IS the mirror - it already accepts a duration and exits on
+    # its own, so (unlike Windows' cmd.exe) no wrapper arguments are needed.
+    $script:StubSource = '/bin/sleep'
+    $script:AppOsKey = 'darwin'
+}
+
+function Deploy-Stub-MacOS {
+    param([string]$ExeName)
+
+    if (-not (Test-Path $script:MirrorsDir)) {
+        New-Item -ItemType Directory -Path $script:MirrorsDir -Force | Out-Null
+    }
+    if (-not (Test-Path $script:StubSource)) {
+        throw "Stub source not found: $script:StubSource"
+    }
+
+    $target = Join-Path $script:MirrorsDir $ExeName
+    Copy-Item -Path $script:StubSource -Destination $target -Force
+    # Copy-Item doesn't reliably preserve the executable bit across
+    # filesystems/pwsh versions - set it explicitly rather than assume.
+    & chmod 755 $target
+    return $target
+}
+
+function Start-Mirror-MacOS {
+    param([string]$ExePath)
+
+    $seconds = [int]$MirrorDurationSeconds
+    $proc = Start-Process -FilePath $ExePath -ArgumentList "$seconds" -PassThru
+
+    Start-Sleep -Milliseconds 1200
+    $alive = $false
+    try { $alive = -not (Get-Process -Id $proc.Id -ErrorAction Stop).HasExited } catch { $alive = $false }
+
+    if (-not $alive) {
+        Write-Err2 "Process exited immediately after launch (PID $($proc.Id) is gone)"
+        Write-Meta "Check Gatekeeper isn't blocking the renamed binary in: $script:MirrorsDir"
+    }
+
+    return [PSCustomObject]@{ Id = $proc.Id; Alive = $alive }
+}
+
+# --- src/Common/Discovery.ps1 ----------------------------------------------
+# ---------------------------------------------------------------------------
+# Game resolution - fetching/caching Discord's detectable-apps list, scoring
+# a typed name against it, falling back to Steam's search for a canonical
+# name, and picking which platform-appropriate executable to impersonate.
+# Entirely cross-platform: the only platform-specific bit is which "os" key
+# ($script:AppOsKey, set by Initialize-Platform) to filter executables by.
 # ---------------------------------------------------------------------------
 
 function Get-DetectableApps {
-    if (-not (Test-Path $CacheDir)) {
-        New-Item -ItemType Directory -Path $CacheDir -Force | Out-Null
-    }
-
-    if ((Test-Path $CacheFile) -and
-        ((Get-Item $CacheFile).LastWriteTime -gt (Get-Date).AddHours(-$CacheMaxAgeHours))) {
-        $age = Format-TimeAgo (Get-Item $CacheFile).LastWriteTime
+    if ((Test-Path $script:CacheFile) -and
+        ((Get-Item $script:CacheFile).LastWriteTime -gt (Get-Date).AddHours(-$CacheMaxAgeHours))) {
+        $age = Format-TimeAgo (Get-Item $script:CacheFile).LastWriteTime
         Write-Meta "Using cached game list (refreshed $age)"
-        return Get-Content $CacheFile -Raw | ConvertFrom-Json
+        return Get-Content $script:CacheFile -Raw | ConvertFrom-Json
     }
 
     $apps = Invoke-WithSpinner -Message "Fetching Discord's detectable game list..." -Action {
         Invoke-RestMethod "https://discord.com/api/v10/applications/detectable"
     }
-    $apps | ConvertTo-Json -Depth 10 | Set-Content $CacheFile
+    $apps | ConvertTo-Json -Depth 10 | Set-Content $script:CacheFile
     Write-Meta "Cached $($apps.Count) known games"
     return $apps
 }
@@ -207,171 +554,75 @@ function Find-GameMatch {
 }
 
 function Select-BestExecutable {
-    param($Executables, [int]$PresetChoice = 0)
+    param($Executables, [int]$PresetChoice = 0, [bool]$ForcePrompt = $false)
 
-    $win = @($Executables | Where-Object { $_.os -eq 'win32' -and -not $_.is_launcher })
-    if ($win.Count -eq 0) {
-        $win = @($Executables | Where-Object { $_.os -eq 'win32' })
+    $osExes = @($Executables | Where-Object { $_.os -eq $script:AppOsKey -and -not $_.is_launcher })
+    if ($osExes.Count -eq 0) {
+        $osExes = @($Executables | Where-Object { $_.os -eq $script:AppOsKey })
     }
-    if ($win.Count -eq 0) { return $null }
-    if ($win.Count -eq 1) { return $win[0] }
+    if ($osExes.Count -eq 0) { return $null }
+    if ($osExes.Count -eq 1) { return $osExes[0] }
 
     # Prefer a top-level exe (no subfolder) as the most likely main game binary.
-    $topLevel = @($win | Where-Object { $_.name -notmatch '/' })
-    $ordered = if ($topLevel.Count -gt 0) { $topLevel + ($win | Where-Object { $_.name -match '/' }) } else { $win }
+    $topLevel = @($osExes | Where-Object { $_.name -notmatch '/' })
+    $ordered = if ($topLevel.Count -gt 0) { $topLevel + ($osExes | Where-Object { $_.name -match '/' }) } else { $osExes }
 
-    # Discord's detection just checks the process name against its list, so
-    # any of these is equally "correct" - no need to ask, always take the
-    # first (unless a specific one was requested via -ExeChoice).
     if ($PresetChoice -ge 1 -and $PresetChoice -le $ordered.Count) {
         Write-Meta "Multiple executables found - using [$PresetChoice] $($ordered[$PresetChoice - 1].name) (preset)"
         return $ordered[$PresetChoice - 1]
     }
-    Write-Meta "Multiple executables found - using $($ordered[0].name)"
-    return $ordered[0]
-}
 
-function Deploy-Stub {
-    param([string]$ExeName)
-
-    if (-not (Test-Path $MirrorsDir)) {
-        New-Item -ItemType Directory -Path $MirrorsDir -Force | Out-Null
-    }
-    if (-not (Test-Path $StubSource)) {
-        throw "Stub source not found: $StubSource"
+    # Discord's detection just checks the process name against its list, so
+    # any of these is equally "correct" - no need to ask, always take the
+    # first, unless the user explicitly wants to pick (e.g. the first one
+    # didn't get detected for some reason) via a trailing --pick flag.
+    if (-not $ForcePrompt) {
+        Write-Meta "Multiple executables found - using $($ordered[0].name) (add --pick to choose one)"
+        return $ordered[0]
     }
 
-    $target = Join-Path $MirrorsDir $ExeName
-    Copy-Item -Path $StubSource -Destination $target -Force
-    return $target
-}
-
-function Test-IsElevated {
-    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
-    return (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-}
-
-function Start-DeElevated {
-    param([string]$FilePath, [string]$Arguments)
-
-    # A standard-integrity Discord process can't properly see into a
-    # higher-integrity (elevated) one - UIPI blocks it. If this script is
-    # running elevated, the stub must still launch at standard integrity, so
-    # hand the launch to a Limited-rights scheduled task instead of spawning
-    # it directly (which would inherit our elevated token).
-    $escapedPath = $FilePath.Replace("'", "''")
-    $escapedArgs = $Arguments.Replace("'", "''")
-    $inner = "Start-Process -FilePath '$escapedPath' -ArgumentList '$escapedArgs' -WindowStyle Normal"
-    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($inner))
-
-    $taskName = "QuestMirror_$([guid]::NewGuid().ToString('N').Substring(0, 8))"
-    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -WindowStyle Hidden -EncodedCommand $encoded"
-    $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -RunLevel Limited
-    Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Force | Out-Null
-    try {
-        Start-ScheduledTask -TaskName $taskName
-        $deadline = (Get-Date).AddSeconds(5)
-        $proc = $null
-        while ((Get-Date) -lt $deadline -and -not $proc) {
-            Start-Sleep -Milliseconds 300
-            $proc = Get-Process | Where-Object { $_.Path -eq $FilePath } | Select-Object -First 1
+    Write-Warn2 "Multiple executables found for this game:"
+    $picked = Read-MenuSelection -Items @($ordered | ForEach-Object { $_.name }) -DefaultIndex 0
+    if ($null -eq $picked) {
+        # Arrow-key menu can't be rendered here (no VT support, or the
+        # window's too short) - fall back to the plain numbered prompt.
+        for ($i = 0; $i -lt $ordered.Count; $i++) {
+            Write-Host ("      [{0}] {1}" -f ($i + 1), $ordered[$i].name) -ForegroundColor Gray
         }
-        return $proc
-    } finally {
-        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-    }
-}
-
-Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-public class QuestMirrorNative {
-    [DllImport("user32.dll")]
-    public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
-}
-"@
-
-function Find-MirrorWindowHandle {
-    param([int]$ProcessId, [string]$ExeName)
-
-    # The renamed process itself, a classic conhost.exe child, or - on
-    # machines where Windows Terminal is the default terminal app - a
-    # WindowsTerminal.exe window can each end up owning the actual HWND,
-    # so all three have to be checked (confirmed via live testing).
-    $deadline = (Get-Date).AddSeconds(6)
-    while ((Get-Date) -lt $deadline) {
-        $proc = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
-        if ($proc -and $proc.MainWindowHandle -ne [IntPtr]::Zero) { return $proc.MainWindowHandle }
-
-        $conhosts = Get-CimInstance Win32_Process -Filter "ParentProcessId=$ProcessId AND Name='conhost.exe'" -ErrorAction SilentlyContinue
-        foreach ($c in $conhosts) {
-            $chProc = Get-Process -Id $c.ProcessId -ErrorAction SilentlyContinue
-            if ($chProc -and $chProc.MainWindowHandle -ne [IntPtr]::Zero) { return $chProc.MainWindowHandle }
+        Write-Host -NoNewline "    Pick one (Enter for [1]): " -ForegroundColor DarkGray
+        $pick = Read-Host
+        $picked = 0
+        $valid = $pick -and [int]::TryParse($pick, [ref]$picked) -and $picked -ge 1 -and $picked -le $ordered.Count
+        if ($valid) {
+            $picked -= 1
+        } else {
+            if ($pick) { Write-Meta "'$pick' isn't valid (1-$($ordered.Count)), defaulting to [1]" }
+            $picked = 0
         }
-
-        $wt = Get-Process WindowsTerminal -ErrorAction SilentlyContinue |
-            Where-Object { $_.MainWindowTitle -like "*$ExeName*" -and $_.MainWindowHandle -ne [IntPtr]::Zero } |
-            Select-Object -First 1
-        if ($wt) { return $wt.MainWindowHandle }
-
-        Start-Sleep -Milliseconds 300
     }
-    return [IntPtr]::Zero
+    Write-Ok "Using [$($picked + 1)] $($ordered[$picked].name)"
+    return $ordered[$picked]
 }
 
-function Hide-MirrorWindow {
-    param([int]$ProcessId, [string]$ExeName)
-
-    $hwnd = Find-MirrorWindowHandle -ProcessId $ProcessId -ExeName $ExeName
-    if ($hwnd -eq [IntPtr]::Zero) {
-        Write-Warn2 "Couldn't locate the mirror's window to hide it - it may briefly flash on screen"
-        return
-    }
-    # SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE. The window stays in its
-    # normal (restored) state - Discord only counts the mirror as running
-    # while it's not minimized - just relocated off every monitor.
-    [QuestMirrorNative]::SetWindowPos($hwnd, [IntPtr]::Zero, -32000, -32000, 0, 0, 0x15) | Out-Null
-}
-
-function Start-Mirror {
-    param([string]$ExePath)
-
-    # Discord only counts the mirror as running while its window is in a
-    # normal (restored) state - Minimized reads as not-running (confirmed
-    # via live testing). So launch visibly, then move the window off every
-    # monitor instead of minimizing it.
-    $seconds = [int]$MirrorDurationSeconds
-    $mirrorArgs = "/c timeout /t $seconds /nobreak >nul"
-    $exeName = Split-Path $ExePath -Leaf
-
-    if (Test-IsElevated) {
-        Write-Meta "Running elevated - launching mirror at standard integrity so Discord can see it"
-        $proc = Start-DeElevated -FilePath $ExePath -Arguments $mirrorArgs
-        if (-not $proc) {
-            Write-Err2 "De-elevated launch didn't produce a matching process in time"
-            return [PSCustomObject]@{ Id = $null; Alive = $false }
-        }
-    } else {
-        $proc = Start-Process -FilePath $ExePath -ArgumentList $mirrorArgs -WindowStyle Normal -PassThru
-    }
-
-    Hide-MirrorWindow -ProcessId $proc.Id -ExeName $exeName
-
-    Start-Sleep -Milliseconds 1200
-    $alive = $false
-    try { $alive = -not (Get-Process -Id $proc.Id -ErrorAction Stop).HasExited } catch { $alive = $false }
-
-    if (-not $alive) {
-        Write-Err2 "Process exited immediately after launch (PID $($proc.Id) is gone)"
-        Write-Meta "Likely cause: antivirus killing a renamed system exe on sight"
-        Write-Meta "Check Windows Security -> Protection history, then exclude: $MirrorsDir"
-    }
-
-    return [PSCustomObject]@{ Id = $proc.Id; Alive = $alive }
-}
+# --- src/Common/Queue.ps1 --------------------------------------------------
+# ---------------------------------------------------------------------------
+# Mirror queue - only one mirror runs at a time; anything requested while
+# one is active goes into $script:MirrorQueue and auto-starts once the
+# active mirror exits. Cross-platform: relies only on Get-Process/Path and
+# the Deploy-Stub/Start-Mirror dispatchers from PlatformDispatch.ps1.
+# ---------------------------------------------------------------------------
 
 function Get-ActiveMirrorProcesses {
-    return Get-Process | Where-Object { $_.Path -and $_.Path.StartsWith($MirrorsDir, [StringComparison]::OrdinalIgnoreCase) }
+    return Get-Process | Where-Object { $_.Path -and $_.Path.StartsWith($script:MirrorsDir, [StringComparison]::OrdinalIgnoreCase) }
+}
+
+function Get-ActiveMirrorInfo {
+    Get-ActiveMirrorProcesses | ForEach-Object {
+        $exeName = Split-Path $_.Path -Leaf
+        $displayName = $script:MirrorNameMap[$exeName]
+        if (-not $displayName) { $displayName = $exeName }
+        [PSCustomObject]@{ Process = $_; ExeName = $exeName; DisplayName = $displayName }
+    }
 }
 
 function Test-MirrorActive {
@@ -379,43 +630,46 @@ function Test-MirrorActive {
 }
 
 function Stop-Mirror {
-    param([string]$ExeName)
+    param([string]$Query)
 
-    $procs = Get-Process | Where-Object { $_.Path -and (Split-Path $_.Path -Leaf) -eq $ExeName }
-    if (-not $procs) {
-        Write-Warn2 "No running mirror named '$ExeName' found"
+    $active = @(Get-ActiveMirrorInfo)
+    $matched = @($active | Where-Object { $_.DisplayName -eq $Query -or $_.ExeName -eq $Query })
+    if ($matched.Count -eq 0) {
+        $matched = @($active | Where-Object { $_.DisplayName -like "*$Query*" -or $_.ExeName -like "*$Query*" })
+    }
+
+    if ($matched.Count -eq 0) {
+        Write-Warn2 "No running mirror matching '$Query' found"
         return
     }
-    foreach ($p in $procs) {
-        Stop-Process -Id $p.Id -Force
-        Write-Ok "Stopped $ExeName (PID $($p.Id))"
+    foreach ($m in $matched) {
+        Stop-Process -Id $m.Process.Id -Force
+        Write-Ok "Stopped $($m.DisplayName) (PID $($m.Process.Id))"
     }
 }
 
 function Stop-AllMirrors {
-    $procs = Get-ActiveMirrorProcesses
-    if (-not $procs) {
+    $active = @(Get-ActiveMirrorInfo)
+    if ($active.Count -eq 0) {
         Write-Warn2 "No active mirrors to stop"
         return
     }
-    foreach ($p in $procs) {
-        $name = Split-Path $p.Path -Leaf
-        Stop-Process -Id $p.Id -Force
-        Write-Ok "Stopped $name (PID $($p.Id))"
+    foreach ($m in $active) {
+        Stop-Process -Id $m.Process.Id -Force
+        Write-Ok "Stopped $($m.DisplayName) (PID $($m.Process.Id))"
     }
 }
 
 function Show-ActiveMirrors {
-    $procs = Get-ActiveMirrorProcesses
-    if (-not $procs) {
+    $active = @(Get-ActiveMirrorInfo)
+    if ($active.Count -eq 0) {
         Write-Meta "No active mirrors."
     } else {
         Write-Host ""
-        Write-Host ("  {0,-28} {1,-8} {2}" -f 'EXE', 'PID', 'EXPIRES') -ForegroundColor DarkGray
-        foreach ($p in $procs) {
-            $name = Split-Path $p.Path -Leaf
-            $expires = $p.StartTime.AddSeconds($MirrorDurationSeconds).ToString('HH:mm:ss')
-            Write-Host ("  {0,-28} {1,-8} {2}" -f $name, $p.Id, $expires) -ForegroundColor White
+        Write-Host ("  {0,-28} {1,-8} {2}" -f 'GAME', 'PID', 'EXPIRES') -ForegroundColor DarkGray
+        foreach ($m in $active) {
+            $expires = $m.Process.StartTime.AddSeconds($MirrorDurationSeconds).ToString('HH:mm:ss')
+            Write-Host ("  {0,-28} {1,-8} {2}" -f $m.DisplayName, $m.Process.Id, $expires) -ForegroundColor White
         }
         Write-Host ""
     }
@@ -431,18 +685,6 @@ function Show-ActiveMirrors {
     }
 }
 
-function Show-Help {
-    Write-Host ""
-    Write-Host "  Commands" -ForegroundColor DarkCyan
-    Write-Host "    <game name>       start a mirror, or queue it if one's already running" -ForegroundColor Gray
-    Write-Host "    /status           list active mirrors and the queue" -ForegroundColor Gray
-    Write-Host "    /stop <exe.exe>   stop one mirror" -ForegroundColor Gray
-    Write-Host "    /stop all         stop every active mirror" -ForegroundColor Gray
-    Write-Host "    /help             show this list" -ForegroundColor Gray
-    Write-Host "    /exit             quit (or just press Enter)" -ForegroundColor Gray
-    Write-Host ""
-}
-
 function Invoke-QueuePump {
     if ($script:MirrorQueue.Count -eq 0 -or (Test-MirrorActive)) { return }
 
@@ -452,49 +694,17 @@ function Invoke-QueuePump {
     Start-MirrorForGame -ExeName $next.ExeName -DisplayName $next.DisplayName
 }
 
-function Read-MirrorCommand {
-    # A plain Read-Host blocks the thread, and .NET timer/event callbacks
-    # don't get pumped reliably while it's blocked (confirmed via live
-    # testing - a queued mirror never auto-started while sitting idle at a
-    # Read-Host prompt). Polling for keystrokes here instead lets the queue
-    # advance itself while the prompt sits idle with nothing typed.
-    $prompt = { Write-Host -NoNewline "quest-mirror " -ForegroundColor DarkCyan; Write-Host -NoNewline "> " -ForegroundColor DarkGray }
-    & $prompt
-    $buffer = New-Object System.Text.StringBuilder
+function Get-StopCandidates {
+    param([string]$Typed)
 
-    while ($true) {
-        if ([Console]::KeyAvailable) {
-            $key = [Console]::ReadKey($true)
-            if ($key.Key -eq 'Enter') {
-                Write-Host ""
-                return $buffer.ToString()
-            } elseif ($key.Key -eq 'Backspace') {
-                if ($buffer.Length -gt 0) {
-                    $buffer.Length -= 1
-                    Write-Host -NoNewline "`b `b"
-                }
-            } elseif (-not [char]::IsControl($key.KeyChar)) {
-                [void]$buffer.Append($key.KeyChar)
-                Write-Host -NoNewline $key.KeyChar
-            }
-            continue
-        }
-
-        Start-Sleep -Milliseconds 150
-        $before = $script:MirrorQueue.Count
-        Invoke-QueuePump
-        if ($script:MirrorQueue.Count -lt $before) {
-            # A queued mirror just started - redraw the prompt line so the
-            # user's partially-typed input isn't lost underneath the output.
-            Write-Host ""
-            & $prompt
-            Write-Host -NoNewline $buffer.ToString()
-        }
-    }
+    $names = @((Get-ActiveMirrorInfo | ForEach-Object { $_.DisplayName }) + 'all') | Select-Object -Unique
+    return @($names | Where-Object { $_.ToLowerInvariant().StartsWith($Typed.ToLowerInvariant()) })
 }
 
 function Start-MirrorForGame {
     param([string]$ExeName, [string]$DisplayName)
+
+    $script:MirrorNameMap[$ExeName] = $DisplayName
 
     $target = Deploy-Stub -ExeName $ExeName
     $proc = Start-Mirror -ExePath $target
@@ -502,12 +712,385 @@ function Start-MirrorForGame {
     if ($proc.Alive) {
         $expires = (Get-Date).AddSeconds($MirrorDurationSeconds).ToString('HH:mm:ss')
         Write-Ok "Mirror running - PID $($proc.Id), expires ~$expires"
-        Write-Meta "Stop early with: /stop $ExeName"
+        Write-Meta "Stop early with: /stop $DisplayName"
     }
+}
+
+# --- src/Common/InputLoop.ps1 ----------------------------------------------
+# ---------------------------------------------------------------------------
+# Dropdown completion menu - draws below the current input line using only
+# relative ANSI/VT moves (save/restore cursor, cursor-next-line, line-clear),
+# never [Console]::CursorTop/SetCursorPosition. Takes only plain strings and
+# indices - no /stop-specific knowledge lives here - so it's general enough
+# to reuse for other pickers (e.g. Select-BestExecutable's ambiguous-match
+# prompt in Discovery.ps1) even though /stop is the primary user.
+#
+# Everything here is cross-platform: it only touches [Console] and the
+# Enable-VirtualTerminal abstraction from UI.ps1, both of which work the
+# same way (from this code's perspective) on Windows and macOS terminals.
+# ---------------------------------------------------------------------------
+
+function Clear-InlineOverlay {
+    param([int]$Length)
+    if ($Length -le 0) { return }
+    Write-Host -NoNewline (' ' * $Length)
+    [Console]::CursorLeft = [Console]::CursorLeft - $Length
+}
+
+function Write-InlineOverlay {
+    param([string]$Text)
+    if (-not $Text) { return 0 }
+    Write-Host -NoNewline $Text -ForegroundColor DarkGray
+    [Console]::CursorLeft = [Console]::CursorLeft - $Text.Length
+    return $Text.Length
+}
+
+function Invoke-BelowCursor {
+    param([int]$RowCount, [scriptblock]$RowRenderer)
+    if ($RowCount -le 0) { return }
+    Write-Host -NoNewline "$($script:Esc)[?25l$($script:Esc)[s"
+    for ($i = 0; $i -lt $RowCount; $i++) {
+        Write-Host -NoNewline "$($script:Esc)[1E$($script:Esc)[2K"
+        & $RowRenderer $i
+    }
+    Write-Host -NoNewline "$($script:Esc)[u$($script:Esc)[?25h"
+}
+
+# Always emits exactly (MaxVisibleRows + 2) rows - a divider, the candidate
+# rows, and a hint row - clearing every row on every call. That constant
+# row-count is what guarantees a shorter/longer redraw never leaves stray
+# characters behind, which is the failure mode this whole menu replaces.
+function Show-CompletionMenu {
+    param(
+        [string[]]$Candidates,
+        [string]$Filter,
+        [int]$SelectedIndex,
+        [int]$MaxVisibleRows = 5
+    )
+    $width = [Math]::Max(20, [Console]::WindowWidth - 1)
+    Invoke-BelowCursor -RowCount ($MaxVisibleRows + 2) -RowRenderer {
+        param($i)
+        if ($i -eq 0) {
+            Write-Host -NoNewline (([string]$script:HRule) * [Math]::Min(46, $width)) -ForegroundColor DarkGray
+        } elseif ($i -le $MaxVisibleRows) {
+            $idx = $i - 1
+            if ($idx -lt $Candidates.Count) {
+                $c = $Candidates[$idx]
+                $maxLen = [Math]::Max(1, $width - 6)
+                if ($c.Length -gt $maxLen) { $c = $c.Substring(0, [Math]::Max(1, $maxLen - 1)) + [char]0x2026 }
+                $matchLen = [Math]::Min($Filter.Length, $c.Length)
+                $matched = $c.Substring(0, $matchLen)
+                $rest = $c.Substring($matchLen)
+                if ($idx -eq $SelectedIndex) {
+                    Write-Host -NoNewline "  $($script:Glyph.Step) " -ForegroundColor Cyan
+                    Write-Host -NoNewline $matched -ForegroundColor Cyan
+                    Write-Host -NoNewline $rest -ForegroundColor White
+                } else {
+                    Write-Host -NoNewline "    "
+                    Write-Host -NoNewline $matched -ForegroundColor DarkCyan
+                    Write-Host -NoNewline $rest -ForegroundColor DarkGray
+                }
+            }
+        } else {
+            $hint = "  Up/Dn move   Tab cycle   Enter select   Esc cancel"
+            if ($Candidates.Count -gt $MaxVisibleRows) {
+                $hint += "   (+$($Candidates.Count - $MaxVisibleRows) more)"
+            }
+            if ($hint.Length -gt $width) { $hint = $hint.Substring(0, $width) }
+            Write-Host -NoNewline $hint -ForegroundColor DarkGray
+        }
+    }
+}
+
+function Hide-CompletionMenu {
+    param([int]$TotalRows)
+    Invoke-BelowCursor -RowCount $TotalRows -RowRenderer { param($i) }
+}
+
+# One-shot arrow-key list picker built on the same Show-CompletionMenu
+# rendering as /stop - Up/Down (or Tab) move the highlight, Enter accepts,
+# Escape accepts $DefaultIndex (same as pressing Enter with nothing typed in
+# the old numbered prompts). Returns the chosen 0-based index, or $null if
+# the menu can't be rendered here (no VT support, or the window's too short)
+# - callers should fall back to their own plain prompt in that case, same as
+# before this existed.
+function Read-MenuSelection {
+    param(
+        [string[]]$Items,
+        [int]$DefaultIndex = 0,
+        [int]$MaxVisibleRows = 8
+    )
+
+    if ($Items.Count -eq 0) { return $null }
+    $vtOk = Enable-VirtualTerminal
+    $maxVisible = [Math]::Min($MaxVisibleRows, $Items.Count)
+    $totalRows = $maxVisible + 2
+    if (-not $vtOk -or (([Console]::WindowHeight - 3) -lt $totalRows)) { return $null }
+
+    1..$totalRows | ForEach-Object { Write-Host "" }
+    Write-Host -NoNewline ("$($script:Esc)[{0}A" -f $totalRows)
+
+    $selected = $DefaultIndex
+    Show-CompletionMenu -Candidates $Items -Filter '' -SelectedIndex $selected -MaxVisibleRows $maxVisible
+
+    while ($true) {
+        $key = [Console]::ReadKey($true)
+        if ($key.Key -eq 'Enter') { break }
+        if ($key.Key -eq 'Escape') { $selected = $DefaultIndex; break }
+        if ($key.Key -eq 'UpArrow') {
+            $selected = ($selected - 1 + $Items.Count) % $Items.Count
+        } elseif ($key.Key -eq 'DownArrow' -or $key.Key -eq 'Tab') {
+            $selected = ($selected + 1) % $Items.Count
+        } else {
+            continue
+        }
+        Show-CompletionMenu -Candidates $Items -Filter '' -SelectedIndex $selected -MaxVisibleRows $maxVisible
+    }
+
+    Hide-CompletionMenu -TotalRows $totalRows
+    return $selected
+}
+
+# Draws the "quest-mirror > " prompt (optionally re-echoing already-typed
+# text, for the queue-pump mid-typing redraw). When a completion menu may be
+# used this turn, it first prints $script:MenuTotalRows blank lines and
+# moves back up over them with a *relative* cursor-up - this is what
+# guarantees room exists below the prompt before anything ever tries to
+# save/restore into that space, so the menu's own rendering never has to
+# provoke a fresh scroll mid-render.
+function Show-Prompt {
+    param([string]$CurrentText = '')
+    if ($script:UseMenu) {
+        1..$script:MenuTotalRows | ForEach-Object { Write-Host "" }
+        Write-Host -NoNewline ("$($script:Esc)[{0}A" -f $script:MenuTotalRows)
+    }
+    Write-Host -NoNewline "quest-mirror " -ForegroundColor DarkCyan
+    Write-Host -NoNewline "> " -ForegroundColor DarkGray
+    if ($CurrentText) { Write-Host -NoNewline $CurrentText }
+}
+
+function Read-MirrorCommand {
+    # A plain Read-Host blocks the thread, and .NET timer/event callbacks
+    # don't get pumped reliably while it's blocked (confirmed via live
+    # testing - a queued mirror never auto-started while sitting idle at a
+    # Read-Host prompt). Polling for keystrokes here instead lets the queue
+    # advance itself while the prompt sits idle with nothing typed.
+    #
+    # /stop completion prefers a real dropdown menu (Show-CompletionMenu)
+    # drawn below the prompt via Invoke-BelowCursor, which only ever uses
+    # *relative* ANSI/VT cursor moves (save/restore, next-line). An earlier
+    # version tried a second line using Console.CursorTop directly and hit
+    # Windows Terminal's long-standing ConPTY bugs where CursorTop/
+    # SetCursorPosition desyncs from the real cursor across rows - that's a
+    # different, buggier code path than relative VT sequences, which the
+    # terminal itself interprets natively. If VT mode can't be enabled (or
+    # the window's too short to fit the menu), $script:UseMenu stays false
+    # and this falls all the way back to the original single-row-only ghost
+    # text + Tab-cycle counter, unchanged.
+    $vtOk = Enable-VirtualTerminal
+    $maxVisible = 5
+    $script:MenuTotalRows = $maxVisible + 2
+    $script:UseMenu = $false
+    if ($vtOk) {
+        $script:UseMenu = ([Console]::WindowHeight - 3) -ge $script:MenuTotalRows
+        if (-not $script:UseMenu) {
+            $maxVisible = [Console]::WindowHeight - 5
+            $script:MenuTotalRows = $maxVisible + 2
+            $script:UseMenu = $maxVisible -ge 1
+        }
+    }
+
+    Show-Prompt
+    $buffer = New-Object System.Text.StringBuilder
+    $tabState = $null
+    $overlayLen = 0
+    $menuState = $null
+    $menuSuppressed = $false
+    $menuSuppressedFilter = ''
+    $lastPump = Get-Date
+
+    while ($true) {
+        if ([Console]::KeyAvailable) {
+            $key = [Console]::ReadKey($true)
+            if (-not $script:UseMenu -and $key.Key -ne 'Tab') { $tabState = $null }
+
+            Clear-InlineOverlay -Length $overlayLen
+            $overlayLen = 0
+
+            if ($key.Key -eq 'Enter') {
+                if ($script:UseMenu -and $menuState -and $menuState.Candidates.Count -gt 0) {
+                    $newText = "/stop " + $menuState.Candidates[$menuState.SelectedIndex]
+                    if ($newText -ne $buffer.ToString()) {
+                        $clear = ("`b" * $buffer.Length) + (' ' * $buffer.Length) + ("`b" * $buffer.Length)
+                        Write-Host -NoNewline $clear
+                        $buffer.Length = 0
+                        [void]$buffer.Append($newText)
+                        Write-Host -NoNewline $newText
+                    }
+                }
+                if ($script:UseMenu) { Hide-CompletionMenu -TotalRows $script:MenuTotalRows }
+                Write-Host ""
+                return $buffer.ToString()
+            } elseif ($key.Key -eq 'Backspace') {
+                if ($buffer.Length -gt 0) {
+                    $buffer.Length -= 1
+                    Write-Host -NoNewline "`b `b"
+                }
+            } elseif ($key.Key -eq 'Tab') {
+                if ($script:UseMenu) {
+                    if ($buffer.ToString() -match '^/stop\s+(.*)$' -and $menuState -and $menuState.Candidates.Count -gt 0) {
+                        $menuState.SelectedIndex = ($menuState.SelectedIndex + 1) % $menuState.Candidates.Count
+                        $newText = "/stop " + $menuState.Candidates[$menuState.SelectedIndex]
+                        $clear = ("`b" * $buffer.Length) + (' ' * $buffer.Length) + ("`b" * $buffer.Length)
+                        Write-Host -NoNewline $clear
+                        $buffer.Length = 0
+                        [void]$buffer.Append($newText)
+                        Write-Host -NoNewline $newText
+                        Show-CompletionMenu -Candidates $menuState.Candidates -Filter $menuState.Filter -SelectedIndex $menuState.SelectedIndex -MaxVisibleRows $maxVisible
+                    }
+                } elseif ($buffer.ToString() -match '^/stop\s+(.*)$') {
+                    if (-not $tabState) {
+                        $candidates = Get-StopCandidates -Typed $Matches[1]
+                        if ($candidates.Count -gt 0) {
+                            $tabState = [PSCustomObject]@{ Candidates = $candidates; Index = 0 }
+                        }
+                    } else {
+                        $tabState.Index = ($tabState.Index + 1) % $tabState.Candidates.Count
+                    }
+                    if ($tabState) {
+                        $newText = "/stop " + $tabState.Candidates[$tabState.Index]
+                        $clear = ("`b" * $buffer.Length) + (' ' * $buffer.Length) + ("`b" * $buffer.Length)
+                        Write-Host -NoNewline $clear
+                        $buffer.Length = 0
+                        [void]$buffer.Append($newText)
+                        Write-Host -NoNewline $newText
+                    }
+                }
+            } elseif ($key.Key -eq 'UpArrow') {
+                if ($script:UseMenu -and $menuState -and $menuState.Candidates.Count -gt 0) {
+                    $menuState.SelectedIndex = ($menuState.SelectedIndex - 1 + $menuState.Candidates.Count) % $menuState.Candidates.Count
+                    Show-CompletionMenu -Candidates $menuState.Candidates -Filter $menuState.Filter -SelectedIndex $menuState.SelectedIndex -MaxVisibleRows $maxVisible
+                }
+            } elseif ($key.Key -eq 'DownArrow') {
+                if ($script:UseMenu -and $menuState -and $menuState.Candidates.Count -gt 0) {
+                    $menuState.SelectedIndex = ($menuState.SelectedIndex + 1) % $menuState.Candidates.Count
+                    Show-CompletionMenu -Candidates $menuState.Candidates -Filter $menuState.Filter -SelectedIndex $menuState.SelectedIndex -MaxVisibleRows $maxVisible
+                }
+            } elseif ($key.Key -eq 'Escape') {
+                if ($script:UseMenu -and $menuState) {
+                    Hide-CompletionMenu -TotalRows $script:MenuTotalRows
+                    $menuSuppressed = $true
+                    $menuSuppressedFilter = if ($buffer.ToString() -match '^/stop\s+(.*)$') { $Matches[1] } else { '' }
+                    $menuState = $null
+                }
+            } elseif (-not [char]::IsControl($key.KeyChar)) {
+                [void]$buffer.Append($key.KeyChar)
+                Write-Host -NoNewline $key.KeyChar
+            }
+
+            # Skip the shared recompute below for the keys that already fully
+            # handled their own redraw above - re-running it for those would
+            # immediately recompute a fresh $menuState (Index reset to 0) and
+            # stomp on the Up/Down/Tab selection that was just made.
+            $skipRecompute = ($key.Key -in @('UpArrow', 'DownArrow', 'Escape')) -or ($script:UseMenu -and $key.Key -eq 'Tab')
+
+            if (-not $skipRecompute) {
+                if ($buffer.ToString() -match '^/stop\s+(.*)$') {
+                    $typed = $Matches[1]
+                    if ($script:UseMenu) {
+                        if ($menuSuppressed -and $typed -eq $menuSuppressedFilter) {
+                            # Escape was just pressed for this exact fragment -
+                            # stay hidden until the user actually changes it.
+                        } else {
+                            $menuSuppressed = $false
+                            $candidates = Get-StopCandidates -Typed $typed
+                            if ($candidates.Count -eq 0) {
+                                if ($menuState) { Hide-CompletionMenu -TotalRows $script:MenuTotalRows }
+                                $menuState = $null
+                            } else {
+                                $menuState = [PSCustomObject]@{ Candidates = $candidates; Filter = $typed; SelectedIndex = 0 }
+                                Show-CompletionMenu -Candidates $candidates -Filter $typed -SelectedIndex 0 -MaxVisibleRows $maxVisible
+                            }
+                        }
+                    } elseif ($tabState) {
+                        if ($tabState.Candidates.Count -gt 1) {
+                            $overlayLen = Write-InlineOverlay -Text (" ({0}/{1})" -f ($tabState.Index + 1), $tabState.Candidates.Count)
+                        }
+                    } elseif ($typed) {
+                        $candidates = Get-StopCandidates -Typed $typed
+                        if ($candidates.Count -gt 0 -and $candidates[0].Length -gt $typed.Length) {
+                            $overlayLen = Write-InlineOverlay -Text $candidates[0].Substring($typed.Length)
+                        }
+                    }
+                } elseif ($script:UseMenu -and $menuState) {
+                    Hide-CompletionMenu -TotalRows $script:MenuTotalRows
+                    $menuState = $null
+                    $menuSuppressed = $false
+                }
+            }
+            continue
+        }
+
+        # Keep this sleep short so typing stays responsive - a 150ms poll
+        # here made every keystroke feel laggy. The queue pump itself (which
+        # enumerates all processes) only needs to run every couple seconds,
+        # not on every idle tick, so it's throttled separately below.
+        Start-Sleep -Milliseconds 25
+        if (((Get-Date) - $lastPump).TotalMilliseconds -lt 2000) { continue }
+        $lastPump = Get-Date
+
+        # Mirrors Invoke-QueuePump's own guard so the menu is only hidden
+        # when a queued mirror is actually about to print output through it -
+        # avoids a needless hide/reshow flicker on every idle poll tick.
+        $queuePumpWillRun = $script:MirrorQueue.Count -gt 0 -and -not (Test-MirrorActive)
+        if ($queuePumpWillRun -and $script:UseMenu -and $menuState) {
+            Hide-CompletionMenu -TotalRows $script:MenuTotalRows
+        }
+
+        $before = $script:MirrorQueue.Count
+        Invoke-QueuePump
+        if ($script:MirrorQueue.Count -lt $before) {
+            # A queued mirror just started - redraw the prompt line so the
+            # user's partially-typed input isn't lost underneath the output.
+            Clear-InlineOverlay -Length $overlayLen
+            Write-Host ""
+            Show-Prompt -CurrentText $buffer.ToString()
+            $overlayLen = 0
+        }
+
+        if ($queuePumpWillRun -and $script:UseMenu -and $menuState) {
+            Show-CompletionMenu -Candidates $menuState.Candidates -Filter $menuState.Filter -SelectedIndex $menuState.SelectedIndex -MaxVisibleRows $maxVisible
+        }
+    }
+}
+
+# --- src/Main.Driver.ps1 ---------------------------------------------------
+# ---------------------------------------------------------------------------
+# Driver - REPL/non-interactive entry point. Everything above this has only
+# defined functions; this is the first place anything actually runs.
+# ---------------------------------------------------------------------------
+
+function Show-Help {
+    Write-Host ""
+    Write-Host "  Commands" -ForegroundColor DarkCyan
+    Write-Host "    <game name>       start a mirror, or queue it if one's already running" -ForegroundColor Gray
+    Write-Host "    <game name> --pick   choose which executable to use, if the first didn't work" -ForegroundColor Gray
+    Write-Host "    /status           list active mirrors and the queue" -ForegroundColor Gray
+    Write-Host "    /stop <game name> stop one mirror (Tab to autocomplete)" -ForegroundColor Gray
+    Write-Host "    /stop all         stop every active mirror" -ForegroundColor Gray
+    Write-Host "    /help             show this list" -ForegroundColor Gray
+    Write-Host "    /exit             quit (or just press Enter)" -ForegroundColor Gray
+    Write-Host ""
 }
 
 function Invoke-QuestMirror {
     param([string]$RawName, [int]$PresetExeChoice = 0, [bool]$Interactive = $true)
+
+    $forcePick = $false
+    if ($RawName -match '^(.*?)\s+--?pick$') {
+        $RawName = $Matches[1].Trim()
+        $forcePick = $true
+    }
 
     Write-Step "Resolving `"$RawName`""
 
@@ -554,9 +1137,10 @@ function Invoke-QuestMirror {
         Write-Ok "Matched $($chosen.name)"
     }
 
-    $exe = Select-BestExecutable -Executables $chosen.executables -PresetChoice $PresetExeChoice
+    $exe = Select-BestExecutable -Executables $chosen.executables -PresetChoice $PresetExeChoice -ForcePrompt $forcePick
     if (-not $exe) {
-        Write-Err2 "`"$($chosen.name)`" has no known Windows executable in Discord's list"
+        $platformLabel = if ($script:PlatformOS -eq 'darwin') { 'macOS' } else { 'Windows' }
+        Write-Err2 "`"$($chosen.name)`" has no known $platformLabel executable in Discord's list"
         return
     }
 
@@ -572,9 +1156,7 @@ function Invoke-QuestMirror {
     Start-MirrorForGame -ExeName $exeName -DisplayName $chosen.name
 }
 
-# ---------------------------------------------------------------------------
-# Driver
-# ---------------------------------------------------------------------------
+Initialize-Platform
 
 if ($GameName) {
     try {
@@ -585,6 +1167,8 @@ if ($GameName) {
     }
 } else {
     Write-BigBanner
+    $platformLabel = if ($script:PlatformOS -eq 'darwin') { 'macOS' } else { 'Windows' }
+    Write-Meta "Platform: $platformLabel"
     Write-Meta "Each mirror runs ~17.5 min. Type /help for commands."
 
     while ($true) {
@@ -599,7 +1183,7 @@ if ($GameName) {
             '^/help$' { Show-Help; continue }
             '^/status$' { Show-ActiveMirrors; continue }
             '^/stop\s+all$' { Stop-AllMirrors; continue }
-            '^/stop\s+(.+)$' { Stop-Mirror -ExeName $Matches[1].Trim(); continue }
+            '^/stop\s+(.+)$' { Stop-Mirror -Query $Matches[1].Trim(); continue }
             default {
                 Write-Divider
                 try {
