@@ -26,7 +26,7 @@ the matching file under `src/` and run `.\build.ps1` to regenerate it, then
 commit both.
 
 ```
-scripts/install.sh            # macOS entrypoint (curl | chmod | run) - hand-maintained, not build.ps1 output
+scripts/install.sh            # macOS entrypoint (curl | bash) - hand-maintained, not build.ps1 output
 src/
 ├── Main.Params.ps1          # param() block + top-level constants (must stay first — see build.ps1)
 ├── Main.Driver.ps1          # Show-Help, Invoke-QuestMirror, REPL/non-interactive driver (must stay last — calls everything else)
@@ -43,11 +43,25 @@ src/
 
 `scripts/install.sh` is the macOS entrypoint referenced in the README's
 `curl -fsSL <raw-url>/scripts/install.sh | bash` line. It's plain bash,
-hand-maintained (not something `build.ps1` produces): it
-installs `pwsh` via Homebrew if missing, downloads the latest `mirror.ps1`
-into `~/Library/Caches/quest-mirror/`, and execs it, passing through any
-arguments. Keep its `MIRROR_URL`/cache-path constants in sync with
-`Platform/MacOS.ps1`'s `Initialize-Platform-MacOS` if either changes.
+hand-maintained (not something `build.ps1` produces). It's fully
+self-contained — **no Homebrew, no sudo, nothing system-wide**: if `pwsh`
+isn't already on PATH (and wasn't already downloaded by a previous run), it
+resolves the latest PowerShell release tag via GitHub's `/releases/latest`
+redirect (falling back to a pinned `PWSH_FALLBACK_VERSION` if that lookup
+fails), downloads the matching portable `osx-arm64`/`osx-x64` tarball from
+PowerShell's GitHub releases, verifies it against the release's published
+`hashes.sha256` (note: that file ships **UTF-16LE encoded** — pipe it through
+`iconv -f UTF-16LE -t UTF-8` before grepping/awk'ing it, or every line looks
+empty), and unpacks it into `~/Library/Caches/quest-mirror/pwsh/<version>/`.
+That download happens at most once — later runs find the cached binary via
+`find .../pwsh -maxdepth 2 -name pwsh` and skip straight to running
+`mirror.ps1`, so a pwsh point-release doesn't force a ~70MB re-download on
+every invocation. All of the script's own status messages go to stderr on
+purpose (see the comment at the top of the file) — never add a plain
+`echo` there without `>&2`, or piping/backtick-wrapping this script can
+misfire in confusing ways. Keep its `MIRROR_URL`/cache-path constants in
+sync with `Platform/MacOS.ps1`'s `Initialize-Platform-MacOS` if either
+changes.
 
 `build.ps1` concatenates the `src/` files **in a fixed order** (defined in its
 `$files` array) into `mirror.ps1`. Order matters for two reasons: PowerShell

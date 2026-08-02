@@ -53,14 +53,18 @@ No download needed - run directly from GitHub in Terminal:
 curl -fsSL https://raw.githubusercontent.com/KiarTV/Discord-Quest/master/scripts/install.sh | bash
 ```
 
-It installs [PowerShell 7+](https://learn.microsoft.com/powershell/scripting/install/installing-powershell-on-macos)
-(`pwsh`) via [Homebrew](https://brew.sh) if it isn't already on your system
-(macOS doesn't ship PowerShell by default - it's required for Discord's
-detectable-apps handling and this script's process management), then
-downloads and runs the latest `mirror.ps1`. Re-running the same command later
-re-downloads it, so it doubles as an update command. To pass arguments
-through to `mirror.ps1` (e.g. the non-interactive mode described below), add
-`-s --` before them:
+Nothing to install beforehand - no Homebrew, no admin password. If
+[PowerShell 7+](https://learn.microsoft.com/powershell/scripting/install/installing-powershell-on-macos)
+(`pwsh`) isn't already on your system (macOS doesn't ship it by default; it's
+required for Discord's detectable-apps handling and this script's process
+management), the installer downloads Microsoft's official portable build
+straight from its GitHub releases, verifies it against the published
+checksum, and unpacks it into `~/Library/Caches/quest-mirror/pwsh/` -
+nothing touches `/usr/local` or any system-wide location. That download only
+happens once; later runs reuse it and just re-fetch the latest `mirror.ps1`,
+so re-running the same command later also doubles as an update command. To
+pass arguments through to `mirror.ps1` (e.g. the non-interactive mode
+described below), add `-s --` before them:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/KiarTV/Discord-Quest/master/scripts/install.sh | bash -s -- -GameName "Roblox"
@@ -122,4 +126,6 @@ worth knowing before editing the platform-specific pieces.
 - First run downloads and caches Discord's detectable-apps list, refreshed
   every 24h.
 - Windows cache/mirror files live under `%LOCALAPPDATA%\quest-mirror\`.
-- macOS cache/mirror files live under `~/Library/Caches/quest-mirror/`.
+- macOS cache/mirror files (plus the downloaded portable `pwsh`, if any) live
+  under `~/Library/Caches/quest-mirror/`. Delete the `pwsh/` subfolder there
+  to force `install.sh` to fetch a fresh PowerShell version.
