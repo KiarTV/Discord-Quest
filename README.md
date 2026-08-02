@@ -47,20 +47,24 @@ irm https://raw.githubusercontent.com/KiarTV/Discord-Quest/master/mirror.ps1 | i
 
 ### macOS
 
-Run the installer from Terminal:
+No download needed - run directly from GitHub in Terminal:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/KiarTV/Discord-Quest/master/scripts/install.sh -o install.sh && chmod +x install.sh && ./install.sh
+curl -fsSL https://raw.githubusercontent.com/KiarTV/Discord-Quest/master/scripts/install.sh | bash
 ```
 
 It installs [PowerShell 7+](https://learn.microsoft.com/powershell/scripting/install/installing-powershell-on-macos)
 (`pwsh`) via [Homebrew](https://brew.sh) if it isn't already on your system
 (macOS doesn't ship PowerShell by default - it's required for Discord's
 detectable-apps handling and this script's process management), then
-downloads and runs `mirror.ps1`. Re-running `./install.sh` re-downloads the
-latest `mirror.ps1`, so it doubles as an update command. Arguments pass
-through to `mirror.ps1`, e.g. `./install.sh -GameName "Roblox"` for the
-non-interactive mode described below.
+downloads and runs the latest `mirror.ps1`. Re-running the same command later
+re-downloads it, so it doubles as an update command. To pass arguments
+through to `mirror.ps1` (e.g. the non-interactive mode described below), add
+`-s --` before them:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/KiarTV/Discord-Quest/master/scripts/install.sh | bash -s -- -GameName "Roblox"
+```
 
 If you already have `pwsh` installed and prefer the same one-liner style as
 Windows, that also works from inside `pwsh`:

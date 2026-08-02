@@ -42,8 +42,8 @@ src/
 ```
 
 `scripts/install.sh` is the macOS entrypoint referenced in the README's
-`curl -fsSL ... -o install.sh && chmod +x install.sh && ./install.sh` line.
-It's plain bash, hand-maintained (not something `build.ps1` produces): it
+`curl -fsSL <raw-url>/scripts/install.sh | bash` line. It's plain bash,
+hand-maintained (not something `build.ps1` produces): it
 installs `pwsh` via Homebrew if missing, downloads the latest `mirror.ps1`
 into `~/Library/Caches/quest-mirror/`, and execs it, passing through any
 arguments. Keep its `MIRROR_URL`/cache-path constants in sync with
