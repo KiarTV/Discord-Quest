@@ -753,8 +753,13 @@ function Invoke-QueuePump {
 function Get-StopCandidates {
     param([string]$Typed)
 
-    $activeNames = Get-ActiveMirrorInfo | ForEach-Object { $_.DisplayName }
-    $queuedNames = $script:MirrorQueue.ToArray() | ForEach-Object { $_.DisplayName }
+    # Each side must be forced to an array (@(...)) at assignment, not just
+    # around the combined expression - a pipeline that yields exactly one
+    # item collapses to a plain scalar string, and string + string is
+    # concatenation ("Apex Legends" + "all" -> "Apex Legendsall"), not the
+    # array-append this needs.
+    $activeNames = @(Get-ActiveMirrorInfo | ForEach-Object { $_.DisplayName })
+    $queuedNames = @($script:MirrorQueue.ToArray() | ForEach-Object { $_.DisplayName })
     $names = @($activeNames + $queuedNames + 'all') | Select-Object -Unique
     return @($names | Where-Object { $_.ToLowerInvariant().StartsWith($Typed.ToLowerInvariant()) })
 }
