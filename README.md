@@ -23,17 +23,9 @@ running - nothing more. This tool:
 This only affects what your own local Discord client detects. It doesn't
 touch your account, other users, or any network service.
 
-**Windows**: the stub is a renamed copy of `cmd.exe`, launched minimized-off-
-screen. Discord's Windows game scanner only picks up processes that own a
-window in a normal (non-minimized) state, so the window is moved off every
-monitor via `SetWindowPos` instead of being minimized. This behavior has been
-confirmed by live testing.
-
-**macOS**: the stub is a renamed copy of `/bin/sleep`, run as a plain
-background process. This is a best-effort implementation - Discord's macOS
-Quest detection is closed-source and hasn't been confirmed against real
-Quests the way the Windows path has. If it doesn't work for you, please open
-an issue with what you tried.
+On macOS, this is a best-effort implementation - Discord's macOS Quest
+detection hasn't been confirmed against real Quests the way the Windows path
+has. If it doesn't work for you, please open an issue with what you tried.
 
 ## Usage
 
@@ -53,25 +45,12 @@ No download needed - run directly from GitHub in Terminal:
 curl -fsSL https://raw.githubusercontent.com/KiarTV/Discord-Quest/master/scripts/install.sh | bash
 ```
 
-Nothing to install beforehand - no Homebrew, no admin password. If
-[PowerShell 7+](https://learn.microsoft.com/powershell/scripting/install/installing-powershell-on-macos)
-(`pwsh`) isn't already on your system (macOS doesn't ship it by default; it's
-required for Discord's detectable-apps handling and this script's process
-management), the installer downloads Microsoft's official portable build
-straight from its GitHub releases, verifies it against the published
-checksum, and unpacks it into `~/Library/Caches/quest-mirror/pwsh/` -
-nothing touches `/usr/local` or any system-wide location. That download only
-happens once; later runs reuse it and just re-fetch the latest `mirror.ps1`,
-so re-running the same command later also doubles as an update command. To
-pass arguments through to `mirror.ps1` (e.g. the non-interactive mode
-described below), add `-s --` before them:
+Nothing to install beforehand - no Homebrew, no admin password needed. If
+PowerShell isn't already on your Mac, the installer downloads it
+automatically the first time you run this and reuses it after that.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/KiarTV/Discord-Quest/master/scripts/install.sh | bash -s -- -GameName "Roblox"
-```
-
-If you already have `pwsh` installed and prefer the same one-liner style as
-Windows, that also works from inside `pwsh`:
+If you already have PowerShell (`pwsh`) installed and prefer the same
+one-liner style as Windows, that also works from inside `pwsh`:
 
 ```powershell
 irm https://raw.githubusercontent.com/KiarTV/Discord-Quest/master/mirror.ps1 | iex
@@ -92,40 +71,21 @@ can queue several games in parallel. Slash commands handle everything else:
 | `/help`               | show the command list                |
 | `/exit` (or blank)    | quit - active mirrors keep running   |
 
-## Local dev / non-interactive mode
+If a game has more than one possible executable, add `--pick` to the game
+name to choose which one to use, e.g. `Apex Legends --pick`.
 
-For faster iteration than the interactive prompt, run the built `mirror.ps1`
-directly with parameters:
+### Skipping the prompt
 
-```powershell
-.\mirror.ps1 -GameName "Roblox"              # auto-picks the default exe
-.\mirror.ps1 -GameName "Roblox" -ExeChoice 2 # force a specific exe from the list
-```
-
-This skips all prompts and is useful for testing changes to the matching or
-executable-selection logic without typing input by hand each run.
-
-## Repository layout
-
-`mirror.ps1` at the repo root is a **generated file** - the single-file
-script the `irm | iex` one-liners above actually fetch and run. The real
-source lives under `src/`, split by concern (game resolution, the mirror
-queue, the input/completion-menu loop, and a `Platform/` folder holding the
-Windows and macOS-specific mechanics behind a common dispatch layer). After
-changing anything under `src/`, rebuild and commit the regenerated file:
+You can also start a mirror directly from the command line instead of using
+the interactive prompt:
 
 ```powershell
-.\build.ps1
+.\mirror.ps1 -GameName "Roblox"
 ```
-
-See [CLAUDE.md](CLAUDE.md) for the full module breakdown and the invariants
-worth knowing before editing the platform-specific pieces.
 
 ## Notes
 
 - First run downloads and caches Discord's detectable-apps list, refreshed
   every 24h.
 - Windows cache/mirror files live under `%LOCALAPPDATA%\quest-mirror\`.
-- macOS cache/mirror files (plus the downloaded portable `pwsh`, if any) live
-  under `~/Library/Caches/quest-mirror/`. Delete the `pwsh/` subfolder there
-  to force `install.sh` to fetch a fresh PowerShell version.
+- macOS cache/mirror files live under `~/Library/Caches/quest-mirror/`.
