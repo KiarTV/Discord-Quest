@@ -56,6 +56,16 @@ function Get-MatchScore {
     return [math]::Round(60 * $matched / $qWords.Count)
 }
 
+function Test-HasPlatformExecutable {
+    param($App)
+    return [bool](@($App.executables) | Where-Object { $_.os -eq $script:AppOsKey })
+}
+
+function Get-StorefrontLinkCount {
+    param($App)
+    return @($App.third_party_skus).Count
+}
+
 function Find-GameMatch {
     param($Apps, [string]$Query)
 
@@ -67,7 +77,20 @@ function Find-GameMatch {
         }
     }
 
-    return $scored | Sort-Object -Property Score -Descending | Select-Object -First 8
+    # Discord's detectable-apps list is self-registered by any developer with
+    # a Discord application, not curated by popularity - a query like "apex"
+    # ties in text score between "Apex Legends" and an obscure "Apex Rush"
+    # that has no executable at all. Break ties (never override a clearly
+    # better text match - this only runs within a single Score value) using
+    # signals from the data that do correlate with "this is a real, known
+    # release": whether it even has an executable for this platform, and how
+    # many storefronts (Steam/Xbox/Epic/...) it's linked to, since obscure or
+    # test entries are rarely linked to any.
+    return $scored | Sort-Object -Property @(
+        @{ Expression = 'Score'; Descending = $true }
+        @{ Expression = { Test-HasPlatformExecutable $_.App }; Descending = $true }
+        @{ Expression = { Get-StorefrontLinkCount $_.App }; Descending = $true }
+    ) | Select-Object -First 8
 }
 
 function Select-BestExecutable {
